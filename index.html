@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Neural Cinema</title>
+    <meta
+      name="description"
+      content="An interactive Three.js visualization of neural network-style signal flow, with decision, vision, and language routing topologies."
+    />
+    <meta property="og:title" content="Neural Cinema" />
+    <meta
+      property="og:description"
+      content="Pause, reseed, change density, and switch between three neural signal-flow topologies."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,650;6..72,760&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="cinema" aria-label="layered neural network visualization">
+      <canvas id="neural-canvas" aria-label="animated layered neural network"></canvas>
+
+      <section class="hud hud-left" aria-label="current layer details">
+        <p class="eyebrow">Forward Pass</p>
+        <h1>Neural Cinema</h1>
+        <div class="readout-grid">
+          <div>
+            <span>Layer</span>
+            <strong id="layer-name">H3</strong>
+          </div>
+          <div>
+            <span>Neurons</span>
+            <strong id="neuron-count">28</strong>
+          </div>
+          <div>
+            <span>Activation</span>
+            <strong id="activation-name">ReLU</strong>
+          </div>
+          <div>
+            <span>Signal</span>
+            <strong id="signal-value">0.00</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="hud hud-right" aria-label="architecture controls">
+        <div>
+          <p class="eyebrow amber">Architecture</p>
+          <h2 id="arch-title">Agent Decision MLP</h2>
+          <p class="topology-readout" id="arch-topology">Policy bottleneck -> gated action fan-out</p>
+        </div>
+        <div class="button-grid" role="group" aria-label="architecture presets">
+          <button class="preset is-active" type="button" data-preset="0">MLP</button>
+          <button class="preset" type="button" data-preset="1">Vision</button>
+          <button class="preset" type="button" data-preset="2">Language</button>
+        </div>
+        <div class="control-row">
+          <button class="icon-button" id="pause-button" type="button" aria-label="Pause animation">
+            <i data-lucide="pause"></i>
+          </button>
+          <button class="icon-button" id="reseed-button" type="button" aria-label="Reseed network">
+            <i data-lucide="shuffle"></i>
+          </button>
+          <label class="density-control">
+            <span>Density</span>
+            <input id="density-slider" type="range" min="25" max="100" value="52" />
+          </label>
+        </div>
+      </section>
+
+      <section class="layer-strip" aria-label="network layers">
+        <div id="layer-cards" class="layer-cards"></div>
+        <div class="timeline">
+          <span id="phase-fill"></span>
+        </div>
+      </section>
+    </main>
+
+    <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
