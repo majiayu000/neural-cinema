@@ -19,6 +19,15 @@ SRI_DIGEST_BYTES = {
     "sha512": 64,
 }
 SRI_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+# Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
+TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
+    "https://unpkg.com/three@0.149.0/build/three.min.js": (
+        "sha384-RRHfJ6w1mTlKUBMYT/hvnRiOzEB/vyRV3DrQOseb6oYfvaZSfdd0byS4bHps0k2R"
+    ),
+    "https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js": (
+        "sha384-uTYyvsSSUZeaPhb5RbKlQa0zY/WpX/QHfvg2mczXyBQOpkWPEDy9lczyp+w7SKXu"
+    ),
+}
 
 
 class SiteParser(HTMLParser):
@@ -76,28 +85,52 @@ def normalize_local_reference(reference: str) -> Path:
     return path
 
 
+def pad_base64(digest: str) -> str:
+    """Add optional Base64 padding so unpadded SRI digests still decode."""
+    remainder = len(digest) % 4
+    if remainder == 0:
+        return digest
+    return digest + ("=" * (4 - remainder))
+
+
+def normalize_sri_token(token: str) -> str | None:
+    """Return algorithm-padded_digest for a well-formed SRI token, else None."""
+    if "-" not in token:
+        return None
+    algorithm, digest = token.split("-", 1)
+    expected_bytes = SRI_DIGEST_BYTES.get(algorithm)
+    if expected_bytes is None or not digest:
+        return None
+    if not SRI_BASE64_RE.fullmatch(digest):
+        return None
+    padded = pad_base64(digest)
+    try:
+        decoded = base64.b64decode(padded, validate=True)
+    except binascii.Error:
+        return None
+    if len(decoded) != expected_bytes:
+        return None
+    return f"{algorithm}-{padded}"
+
+
 def is_valid_sri_integrity(integrity: str) -> bool:
     """Return True when integrity contains at least one well-formed SRI digest."""
     tokens = [token for token in integrity.split() if token]
     if not tokens:
         return False
+    return any(normalize_sri_token(token) is not None for token in tokens)
 
-    for token in tokens:
-        if "-" not in token:
+
+def integrity_matches_trusted(integrity: str, expected: str) -> bool:
+    """True when integrity includes a token equivalent to the trusted digest."""
+    expected_normalized = normalize_sri_token(expected)
+    if expected_normalized is None:
+        return False
+    for token in integrity.split():
+        if not token:
             continue
-        algorithm, digest = token.split("-", 1)
-        expected_bytes = SRI_DIGEST_BYTES.get(algorithm)
-        if expected_bytes is None or not digest:
-            continue
-        if not SRI_BASE64_RE.fullmatch(digest):
-            continue
-        if len(digest) % 4 != 0:
-            continue
-        try:
-            decoded = base64.b64decode(digest, validate=True)
-        except binascii.Error:
-            continue
-        if len(decoded) == expected_bytes:
+        normalized = normalize_sri_token(token)
+        if normalized == expected_normalized:
             return True
     return False
 
@@ -144,6 +177,11 @@ def validate_html(errors: list[str]) -> None:
         crossorigin = script.get("crossorigin") or ""
         if not is_valid_sri_integrity(integrity):
             errors.append(f"external script missing or malformed SRI integrity: {src}")
+        trusted = TRUSTED_EXTERNAL_SCRIPT_INTEGRITY.get(src)
+        if trusted is None:
+            errors.append(f"untrusted external script (no pinned SRI mapping): {src}")
+        elif not integrity_matches_trusted(integrity, trusted):
+            errors.append(f"external script integrity does not match trusted digest: {src}")
         if crossorigin != "anonymous":
             errors.append(f"external script must set crossorigin=anonymous: {src}")
 
