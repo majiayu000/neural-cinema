@@ -23,6 +23,7 @@ class SiteParser(HTMLParser):
         self.canvas_ids: set[str] = set()
         self.link_hrefs: list[str] = []
         self.script_srcs: list[str] = []
+        self.external_scripts: list[dict[str, str | None]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
@@ -35,7 +36,16 @@ class SiteParser(HTMLParser):
         if tag == "link" and values.get("href"):
             self.link_hrefs.append(values["href"])
         if tag == "script" and values.get("src"):
-            self.script_srcs.append(values["src"])
+            src = values["src"]
+            self.script_srcs.append(src)
+            if is_external(src):
+                self.external_scripts.append(
+                    {
+                        "src": src,
+                        "integrity": values.get("integrity"),
+                        "crossorigin": values.get("crossorigin"),
+                    }
+                )
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "title":
@@ -94,6 +104,15 @@ def validate_html(errors: list[str]) -> None:
             continue
         if not path.is_file():
             errors.append(f"local reference does not exist: {reference}")
+
+    for script in parser.external_scripts:
+        src = script["src"] or ""
+        integrity = script.get("integrity") or ""
+        crossorigin = script.get("crossorigin") or ""
+        if not integrity.startswith("sha384-") and not integrity.startswith("sha512-"):
+            errors.append(f"external script missing SRI integrity: {src}")
+        if crossorigin != "anonymous":
+            errors.append(f"external script must set crossorigin=anonymous: {src}")
 
     forbidden_references = ["local" + "host", "127.0.0.1", "/" + "Users/"]
     for forbidden in forbidden_references:
