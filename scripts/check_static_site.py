@@ -52,7 +52,11 @@ def is_external(reference: str) -> bool:
 
 
 def normalize_local_reference(reference: str) -> Path:
-    return ROOT / reference.removeprefix("./")
+    """Resolve a local asset path and ensure it stays under the repository root."""
+    path = (ROOT / reference.removeprefix("./")).resolve()
+    if not path.is_relative_to(ROOT):
+        raise ValueError(f"local reference escapes repository root: {reference}")
+    return path
 
 
 def validate_required_files(errors: list[str]) -> None:
@@ -83,7 +87,11 @@ def validate_html(errors: list[str]) -> None:
             if reference.startswith("http://"):
                 errors.append(f"external reference must use https: {reference}")
             continue
-        path = normalize_local_reference(reference)
+        try:
+            path = normalize_local_reference(reference)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
         if not path.is_file():
             errors.append(f"local reference does not exist: {reference}")
 
