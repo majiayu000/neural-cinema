@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 import sys
 from html.parser import HTMLParser
@@ -12,6 +14,11 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_FILES = ["index.html", "app.js", "styles.css", "README.md", "LICENSE", "CHANGELOG.md"]
+SRI_DIGEST_BYTES = {
+    "sha384": 48,
+    "sha512": 64,
+}
+SRI_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 
 class SiteParser(HTMLParser):
@@ -69,6 +76,32 @@ def normalize_local_reference(reference: str) -> Path:
     return path
 
 
+def is_valid_sri_integrity(integrity: str) -> bool:
+    """Return True when integrity contains at least one well-formed SRI digest."""
+    tokens = [token for token in integrity.split() if token]
+    if not tokens:
+        return False
+
+    for token in tokens:
+        if "-" not in token:
+            continue
+        algorithm, digest = token.split("-", 1)
+        expected_bytes = SRI_DIGEST_BYTES.get(algorithm)
+        if expected_bytes is None or not digest:
+            continue
+        if not SRI_BASE64_RE.fullmatch(digest):
+            continue
+        if len(digest) % 4 != 0:
+            continue
+        try:
+            decoded = base64.b64decode(digest, validate=True)
+        except binascii.Error:
+            continue
+        if len(decoded) == expected_bytes:
+            return True
+    return False
+
+
 def validate_required_files(errors: list[str]) -> None:
     for relative_path in REQUIRED_FILES:
         if not (ROOT / relative_path).is_file():
@@ -109,8 +142,8 @@ def validate_html(errors: list[str]) -> None:
         src = script["src"] or ""
         integrity = script.get("integrity") or ""
         crossorigin = script.get("crossorigin") or ""
-        if not integrity.startswith("sha384-") and not integrity.startswith("sha512-"):
-            errors.append(f"external script missing SRI integrity: {src}")
+        if not is_valid_sri_integrity(integrity):
+            errors.append(f"external script missing or malformed SRI integrity: {src}")
         if crossorigin != "anonymous":
             errors.append(f"external script must set crossorigin=anonymous: {src}")
 
