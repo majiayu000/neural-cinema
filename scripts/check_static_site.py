@@ -23,6 +23,8 @@ SRI_ALGORITHM_STRENGTH = {
     "sha512": 512,
 }
 SRI_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+# SRI/HTML "split on ASCII whitespace": TAB, LF, FF, CR, SPACE (not Unicode NBSP).
+SRI_ASCII_WHITESPACE_RE = re.compile(r"[ \t\n\r\f]+")
 SECURITY_SCRIPT_ATTRS = frozenset({"src", "integrity", "crossorigin"})
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
@@ -116,16 +118,39 @@ def pad_base64(digest: str) -> str:
     return digest + ("=" * (4 - remainder))
 
 
-def normalize_sri_token(token: str) -> str | None:
-    """Return algorithm-padded_digest for a well-formed SRI token, else None."""
+def split_sri_tokens(integrity: str) -> list[str]:
+    """Split integrity metadata on ASCII whitespace only (SRI/HTML rules)."""
+    return [token for token in SRI_ASCII_WHITESPACE_RE.split(integrity) if token]
+
+
+def recognized_sri_algorithm(token: str) -> str | None:
+    """Return known algorithm when digest is Base64-shaped, ignoring length.
+
+    Browsers select the strongest recognized algorithm before validating digest
+    length, so short tokens like sha512-AA== still win over sha384.
+    """
     if "-" not in token:
         return None
     algorithm, digest = token.split("-", 1)
-    expected_bytes = SRI_DIGEST_BYTES.get(algorithm)
-    if expected_bytes is None or not digest:
+    if algorithm not in SRI_DIGEST_BYTES or not digest:
         return None
     if not SRI_BASE64_RE.fullmatch(digest):
         return None
+    padded = pad_base64(digest)
+    try:
+        base64.b64decode(padded, validate=True)
+    except binascii.Error:
+        return None
+    return algorithm
+
+
+def normalize_sri_token(token: str) -> str | None:
+    """Return algorithm-padded_digest for a well-formed SRI token, else None."""
+    algorithm = recognized_sri_algorithm(token)
+    if algorithm is None:
+        return None
+    _, digest = token.split("-", 1)
+    expected_bytes = SRI_DIGEST_BYTES[algorithm]
     padded = pad_base64(digest)
     try:
         decoded = base64.b64decode(padded, validate=True)
@@ -138,7 +163,7 @@ def normalize_sri_token(token: str) -> str | None:
 
 def is_valid_sri_integrity(integrity: str) -> bool:
     """Return True when integrity contains at least one well-formed SRI digest."""
-    tokens = [token for token in integrity.split() if token]
+    tokens = split_sri_tokens(integrity)
     if not tokens:
         return False
     return any(normalize_sri_token(token) is not None for token in tokens)
@@ -149,7 +174,8 @@ def integrity_matches_trusted(integrity: str, expected: str) -> bool:
 
     Browsers verify only the strongest supported algorithm present. A trusted
     sha384 plus a well-formed but wrong sha512 must therefore fail, because the
-    browser will enforce the stronger token.
+    browser will enforce the stronger token. Wrong-length stronger tokens still
+    participate in algorithm selection.
     """
     expected_normalized = normalize_sri_token(expected)
     if expected_normalized is None:
@@ -157,28 +183,30 @@ def integrity_matches_trusted(integrity: str, expected: str) -> bool:
     expected_algorithm = expected_normalized.split("-", 1)[0]
     expected_strength = SRI_ALGORITHM_STRENGTH[expected_algorithm]
 
+    recognized_algorithms: set[str] = set()
     tokens_by_algorithm: dict[str, list[str]] = {}
-    for token in integrity.split():
-        if not token:
+    for token in split_sri_tokens(integrity):
+        algorithm = recognized_sri_algorithm(token)
+        if algorithm is None:
             continue
+        recognized_algorithms.add(algorithm)
         normalized = normalize_sri_token(token)
         if normalized is None:
             continue
-        algorithm = normalized.split("-", 1)[0]
         tokens_by_algorithm.setdefault(algorithm, []).append(normalized)
 
-    if not tokens_by_algorithm:
+    if not recognized_algorithms:
         return False
 
     strongest = max(
-        tokens_by_algorithm,
+        recognized_algorithms,
         key=lambda algorithm: SRI_ALGORITHM_STRENGTH[algorithm],
     )
     if SRI_ALGORITHM_STRENGTH[strongest] != expected_strength:
         # Stronger unexpected tokens win in the browser; weaker-only sets cannot
         # satisfy a stronger trusted pin either.
         return False
-    return expected_normalized in tokens_by_algorithm[strongest]
+    return expected_normalized in tokens_by_algorithm.get(strongest, [])
 
 
 def validate_required_files(errors: list[str]) -> None:
@@ -234,7 +262,8 @@ def validate_html(errors: list[str]) -> None:
             errors.append(f"untrusted external script (no pinned SRI mapping): {src}")
         elif not integrity_matches_trusted(integrity, trusted):
             errors.append(f"external script integrity does not match trusted digest: {src}")
-        if crossorigin != "anonymous":
+        # HTML CORS keyword matching is ASCII case-insensitive (Anonymous == anonymous).
+        if crossorigin.casefold() != "anonymous":
             errors.append(f"external script must set crossorigin=anonymous: {src}")
 
     forbidden_references = ["local" + "host", "127.0.0.1", "/" + "Users/"]
