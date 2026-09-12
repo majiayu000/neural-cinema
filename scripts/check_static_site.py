@@ -18,7 +18,12 @@ SRI_DIGEST_BYTES = {
     "sha384": 48,
     "sha512": 64,
 }
+SRI_ALGORITHM_STRENGTH = {
+    "sha384": 384,
+    "sha512": 512,
+}
 SRI_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+SECURITY_SCRIPT_ATTRS = frozenset({"src", "integrity", "crossorigin"})
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -42,7 +47,8 @@ class SiteParser(HTMLParser):
         self.external_scripts: list[dict[str, str | None]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
+        # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
+        values, duplicates = first_wins_attrs(attrs)
         if tag == "title":
             self._in_title = True
         if tag == "meta" and values.get("name") == "description":
@@ -60,6 +66,9 @@ class SiteParser(HTMLParser):
                         "src": src,
                         "integrity": values.get("integrity"),
                         "crossorigin": values.get("crossorigin"),
+                        "duplicate_security_attrs": sorted(
+                            duplicates & SECURITY_SCRIPT_ATTRS
+                        ),
                     }
                 )
 
@@ -70,6 +79,20 @@ class SiteParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._in_title:
             self.title += data.strip()
+
+
+def first_wins_attrs(
+    attrs: list[tuple[str, str | None]],
+) -> tuple[dict[str, str | None], set[str]]:
+    """Map attributes with browser first-wins semantics; report duplicated names."""
+    values: dict[str, str | None] = {}
+    duplicates: set[str] = set()
+    for key, value in attrs:
+        if key in values:
+            duplicates.add(key)
+            continue
+        values[key] = value
+    return values, duplicates
 
 
 def is_external(reference: str) -> bool:
@@ -122,17 +145,40 @@ def is_valid_sri_integrity(integrity: str) -> bool:
 
 
 def integrity_matches_trusted(integrity: str, expected: str) -> bool:
-    """True when integrity includes a token equivalent to the trusted digest."""
+    """True when browser-selected digests include the trusted token.
+
+    Browsers verify only the strongest supported algorithm present. A trusted
+    sha384 plus a well-formed but wrong sha512 must therefore fail, because the
+    browser will enforce the stronger token.
+    """
     expected_normalized = normalize_sri_token(expected)
     if expected_normalized is None:
         return False
+    expected_algorithm = expected_normalized.split("-", 1)[0]
+    expected_strength = SRI_ALGORITHM_STRENGTH[expected_algorithm]
+
+    tokens_by_algorithm: dict[str, list[str]] = {}
     for token in integrity.split():
         if not token:
             continue
         normalized = normalize_sri_token(token)
-        if normalized == expected_normalized:
-            return True
-    return False
+        if normalized is None:
+            continue
+        algorithm = normalized.split("-", 1)[0]
+        tokens_by_algorithm.setdefault(algorithm, []).append(normalized)
+
+    if not tokens_by_algorithm:
+        return False
+
+    strongest = max(
+        tokens_by_algorithm,
+        key=lambda algorithm: SRI_ALGORITHM_STRENGTH[algorithm],
+    )
+    if SRI_ALGORITHM_STRENGTH[strongest] != expected_strength:
+        # Stronger unexpected tokens win in the browser; weaker-only sets cannot
+        # satisfy a stronger trusted pin either.
+        return False
+    return expected_normalized in tokens_by_algorithm[strongest]
 
 
 def validate_required_files(errors: list[str]) -> None:
@@ -175,6 +221,12 @@ def validate_html(errors: list[str]) -> None:
         src = script["src"] or ""
         integrity = script.get("integrity") or ""
         crossorigin = script.get("crossorigin") or ""
+        duplicate_attrs = script.get("duplicate_security_attrs") or []
+        if duplicate_attrs:
+            joined = ", ".join(duplicate_attrs)
+            errors.append(
+                f"external script has duplicate security attributes ({joined}): {src}"
+            )
         if not is_valid_sri_integrity(integrity):
             errors.append(f"external script missing or malformed SRI integrity: {src}")
         trusted = TRUSTED_EXTERNAL_SCRIPT_INTEGRITY.get(src)
