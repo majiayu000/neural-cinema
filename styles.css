@@ -74,11 +74,14 @@ button {
 }
 
 .dependency-error {
-  position: absolute;
+  /* Fixed to the viewport so short 521–860px layouts (tall .cinema) still show the alert above the fold. */
+  position: fixed;
   top: 50%;
   left: 50%;
   z-index: 6;
   width: min(420px, calc(100vw - 40px));
+  max-height: calc(100svh - 40px);
+  overflow: auto;
   padding: 22px 24px;
   border: 1px solid rgba(255, 79, 63, 0.45);
   border-radius: 8px;
