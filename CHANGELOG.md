@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- None yet.
+- Show a visible dependency-error overlay when Three.js fails to load instead of a blank canvas.
 
 ## 0.1.0 - 2026-06-23
 
