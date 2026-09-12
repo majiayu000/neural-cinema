@@ -73,6 +73,54 @@ button {
   height: 100%;
 }
 
+.dependency-error {
+  /* Fixed to the viewport so short 521–860px layouts (tall .cinema) still show the alert above the fold. */
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 6;
+  width: min(420px, calc(100vw - 40px));
+  max-height: calc(100svh - 40px);
+  overflow: auto;
+  padding: 22px 24px;
+  border: 1px solid rgba(255, 79, 63, 0.45);
+  border-radius: 8px;
+  background: var(--panel-hard);
+  box-shadow: 0 18px 70px var(--shadow);
+  transform: translate(-50%, -50%);
+  backdrop-filter: blur(18px);
+}
+
+.dependency-error[hidden] {
+  display: none;
+}
+
+.dependency-error h2 {
+  margin: 6px 0 10px;
+  color: var(--hot);
+  font-family: Newsreader, Georgia, "Times New Roman", serif;
+  font-size: clamp(26px, 4vw, 34px);
+  font-weight: 760;
+  line-height: 1.15;
+}
+
+.dependency-error p:last-child {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+body.dependency-failed .hud,
+body.dependency-failed .layer-strip {
+  opacity: 0.55;
+}
+
+body.dependency-failed .control-row,
+body.dependency-failed .button-grid {
+  pointer-events: none;
+}
+
 .hud,
 .layer-strip {
   position: absolute;

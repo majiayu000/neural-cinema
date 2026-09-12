@@ -80,6 +80,15 @@
           <span id="phase-fill"></span>
         </div>
       </section>
+
+      <div id="dependency-error" class="dependency-error" hidden role="alert">
+        <p class="eyebrow">Dependency Error</p>
+        <h2>WebGL / Three.js failed to load</h2>
+        <p>
+          The Three.js library did not become available (CDN blocked, offline, or script error).
+          The animation loop was not started. Check your network or ad blocker, then reload.
+        </p>
+      </div>
     </main>
 
     <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>

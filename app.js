@@ -131,8 +131,25 @@ let animationFrame;
 let random = seededRandom(state.seed);
 let frameIndex = 0;
 
+function showDependencyError() {
+  const overlay = document.querySelector("#dependency-error");
+  if (overlay) overlay.hidden = false;
+  document.body.classList.add("dependency-failed");
+  if (dom.layerName) dom.layerName.textContent = "—";
+  if (dom.neuronCount) dom.neuronCount.textContent = "—";
+  if (dom.activationName) dom.activationName.textContent = "—";
+  if (dom.signalValue) dom.signalValue.textContent = "—";
+  if (dom.archTitle) dom.archTitle.textContent = "Unavailable";
+  if (dom.archTopology) {
+    dom.archTopology.textContent = "Three.js / WebGL dependency failed to load";
+  }
+}
+
 function init() {
-  if (!THREE) return;
+  if (!THREE) {
+    showDependencyError();
+    return;
+  }
   window.lucide?.createIcons();
   renderer = new THREE.WebGLRenderer({ canvas: dom.canvas, antialias: true, alpha: true, powerPreference: "high-performance" });
   setRenderPixelRatio();
