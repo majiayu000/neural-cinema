@@ -109,12 +109,14 @@ FOREIGN_HTML_BREAKOUT_TAGS = frozenset(
     }
 )
 FOREIGN_HTML_BREAKOUT_FONT_ATTRS = frozenset({"color", "face", "size"})
-# HTMLParser treats iframe as rawtext/CDATA. Foreign-namespace <iframe> is an
-# ordinary element whose children are markup, so exclude iframe only then.
+# HTMLParser treats script/style/xmp/iframe/noembed/noframes as rawtext/CDATA.
+# In SVG/MathML foreign content those elements are ordinary markup, so nested
+# tags (e.g. <svg><style><script href>) must be retokenized rather than swallowed.
 _HTML_CDATA_CONTENT_ELEMENTS = HTMLParser.CDATA_CONTENT_ELEMENTS
-_FOREIGN_CDATA_CONTENT_ELEMENTS = tuple(
-    name for name in HTMLParser.CDATA_CONTENT_ELEMENTS if name != "iframe"
-)
+_FOREIGN_CDATA_CONTENT_ELEMENTS: tuple[str, ...] = ()
+# Document URL used as the initial base for top-level HTML (matches browsers).
+DOCUMENT_URL = "index.html"
+DECLARATIVE_SHADOW_ROOT_MODES = frozenset({"open", "closed"})
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -442,16 +444,17 @@ class SiteParser(HTMLParser):
         # Nested <math>/<svg> foreign content exits every foreign scope before HTML tags.
         if self._in_foreign_namespace() and self._is_foreign_html_breakout(tag, values):
             self._leave_all_foreign_namespaces()
-        # Foreign-namespace <iframe> is ordinary markup; do not enter HTML rawtext mode.
-        # HTML <iframe> keeps CDATA so fallback body text is not tokenized as tags.
-        if tag == "iframe" and self._in_foreign_namespace():
+        # Foreign-namespace rawtext/CDATA elements are ordinary markup; retokenize
+        # nested tags. HTML keeps CDATA so script/style/iframe bodies stay text.
+        if self._in_foreign_namespace():
             self.CDATA_CONTENT_ELEMENTS = _FOREIGN_CDATA_CONTENT_ELEMENTS
         else:
             self.CDATA_CONTENT_ELEMENTS = _HTML_CDATA_CONTENT_ELEMENTS
         if tag == "template":
-            # Only HTML-namespace <template> is inert. SVG <template> is ordinary
-            # SVG content whose descendant scripts can still execute.
-            if self._in_html_namespace():
+            # Only HTML-namespace <template> is inert. Declarative shadow roots
+            # (shadowrootmode=open|closed) attach and run parser-inserted scripts.
+            # SVG <template> is ordinary SVG content whose descendants can execute.
+            if self._in_html_namespace() and not is_declarative_shadow_root(values):
                 self._template_depth += 1
                 return
         if tag == "noscript":
@@ -464,8 +467,16 @@ class SiteParser(HTMLParser):
             # Ignore tags inside <template>; browsers do not fetch/execute them.
             return
         if self._noscript_depth > 0:
-            # When scripting is disabled, noscript fallbacks still fetch non-script
-            # resources such as stylesheets. Skip executable scripts only.
+            # When scripting is disabled, noscript fallbacks still apply <base>
+            # and fetch non-script resources such as stylesheets. Skip scripts.
+            if (
+                tag == "base"
+                and self._in_html_namespace()
+                and self.base_href is None
+                and "href" in values
+            ):
+                href = values["href"] or ""
+                self.base_href = resolve_reference(href, self._fallback_base)
             if tag == "link" and values.get("href"):
                 href = values["href"]
                 resolved = resolve_reference(href, self._active_base())
@@ -489,9 +500,14 @@ class SiteParser(HTMLParser):
             if self._in_html_namespace() or self._in_math_namespace():
                 self._enter_namespace("math")
         elif tag in MATHML_HTML_INTEGRATION_EXCEPTIONS:
-            # mglyph/malignmark stay MathML only inside MathML text integration points
-            # (mi/mo/mn/ms/mtext). Inside HTML-enabled annotation-xml they are HTML.
-            if self._in_html_namespace() and self._in_mathml_text_integration_point():
+            # mglyph/malignmark stay MathML only when the immediate adjusted
+            # current element is a MathML text integration point. An intervening
+            # HTML child (e.g. span under mi) processes them in the HTML namespace.
+            if (
+                self._in_html_namespace()
+                and self._current_open_tag() in MATHML_HTML_INTEGRATION_POINTS
+                and self._in_mathml_text_integration_point()
+            ):
                 self._enter_namespace("math")
         elif tag in SVG_HTML_INTEGRATION_POINTS:
             # foreignObject, desc, and title are SVG HTML integration points.
@@ -553,7 +569,9 @@ class SiteParser(HTMLParser):
                 self._push_open_tag(tag)
                 return
             # Non-JS MIME types are data blocks: browsers do not fetch/execute src.
-            if not is_executable_script_type(values.get("type")):
+            # When type is absent, a nonempty obsolete language attribute still
+            # selects the classic type as text/<language>.
+            if not is_executable_script_type(effective_script_type(values)):
                 self._push_open_tag(tag)
                 return
             src = script_resource_url(values, self._in_svg_namespace())
@@ -661,7 +679,12 @@ def first_wins_attrs(
 
 
 def is_external(reference: str) -> bool:
-    parsed = urlparse(reference)
+    try:
+        parsed = urlparse(reference)
+    except ValueError:
+        # Malformed references (e.g. https://[) must not abort the checker; treat
+        # scheme-like values as external so policy validation reports them.
+        return ":" in reference or reference.startswith("//")
     if parsed.scheme in {"http", "https", "data"}:
         return True
     # Network-path URLs (//host/...) have a nonempty authority and are fetched
@@ -725,6 +748,24 @@ def script_resource_url(values: dict[str, str | None], in_svg: bool) -> str | No
             return values.get("xlink:href")
         return None
     return values.get("src")
+
+
+def is_declarative_shadow_root(values: dict[str, str | None]) -> bool:
+    """True when template declares an attachable shadow root (open or closed)."""
+    mode = values.get("shadowrootmode")
+    if mode is None:
+        return False
+    return ascii_lower(mode.strip(ASCII_WHITESPACE)) in DECLARATIVE_SHADOW_ROOT_MODES
+
+
+def effective_script_type(values: dict[str, str | None]) -> str | None:
+    """Return the browser-effective script type, including obsolete language."""
+    if "type" in values:
+        return values.get("type")
+    language = values.get("language")
+    if language is not None and language.strip(ASCII_WHITESPACE):
+        return f"text/{language}"
+    return None
 
 
 def is_executable_script_type(script_type: str | None) -> bool:
@@ -798,6 +839,8 @@ def sri_algorithm_and_digest(token: str) -> tuple[str, str] | None:
     if "-" not in token:
         return None
     algorithm, rest = token.split("-", 1)
+    # SRI hash-algo tokens are ASCII case-insensitive (SHA384 == sha384).
+    algorithm = ascii_lower(algorithm)
     if "?" in rest:
         digest, option_expression = rest.split("?", 1)
         # SRI requires a non-empty option expression of VCHAR (%x21-7E) after '?'.
@@ -908,7 +951,9 @@ def validate_html(errors: list[str]) -> None:
         return
 
     text = html_path.read_text(encoding="utf-8")
-    parser = SiteParser()
+    # Seed the document URL so relative/query-only <base href> values resolve
+    # the same way browsers do against the deployed page URL.
+    parser = SiteParser(fallback_base=DOCUMENT_URL)
     parser.feed(text)
     parser.close()
 
