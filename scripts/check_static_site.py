@@ -23,6 +23,8 @@ SRI_ALGORITHM_STRENGTH = {
     "sha512": 512,
 }
 SRI_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+# SRI option-expression = 1*VCHAR (RFC 5234 VCHAR = %x21-7E); non-ASCII is invalid.
+SRI_OPTION_EXPRESSION_RE = re.compile(r"^[\x21-\x7E]+$")
 # SRI/HTML "split on ASCII whitespace": TAB, LF, FF, CR, SPACE (not Unicode NBSP).
 SRI_ASCII_WHITESPACE_RE = re.compile(r"[ \t\n\r\f]+")
 SECURITY_SCRIPT_ATTRS = frozenset({"src", "integrity", "crossorigin"})
@@ -42,6 +44,7 @@ class SiteParser(HTMLParser):
         super().__init__()
         self.title = ""
         self._in_title = False
+        self._template_depth = 0
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
         self.base_href: str | None = None
@@ -52,6 +55,13 @@ class SiteParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
         values, duplicates = first_wins_attrs(attrs)
+        if tag == "template":
+            # Template contents are inert; nested templates still nest the depth.
+            self._template_depth += 1
+            return
+        if self._template_depth > 0:
+            # Ignore tags inside <template>; browsers do not fetch/execute them.
+            return
         if tag == "title":
             self._in_title = True
         if tag == "base" and self.base_href is None and values.get("href"):
@@ -82,6 +92,12 @@ class SiteParser(HTMLParser):
                 )
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "template":
+            if self._template_depth > 0:
+                self._template_depth -= 1
+            return
+        if self._template_depth > 0:
+            return
         if tag == "title":
             self._in_title = False
 
@@ -150,15 +166,17 @@ def sri_algorithm_and_digest(token: str) -> tuple[str, str] | None:
     SRI hash expressions are ``algo-base64[?option-expression]``. Options must be
     removed before digest validation so stronger tokens with ``?foo`` still win
     algorithm selection the way browsers do. A trailing ``?`` with an empty option
-    expression is malformed and must not be treated as a valid hash expression.
+    expression, or a non-VCHAR option expression, is malformed and must not be
+    treated as a valid hash expression.
     """
     if "-" not in token:
         return None
     algorithm, rest = token.split("-", 1)
     if "?" in rest:
         digest, option_expression = rest.split("?", 1)
-        # SRI requires a non-empty option expression after '?'.
-        if not option_expression:
+        # SRI requires a non-empty option expression of VCHAR (%x21-7E) after '?'.
+        # Non-ASCII suffixes (e.g. ?é or ?\u00a0) are malformed and discarded by browsers.
+        if not SRI_OPTION_EXPRESSION_RE.fullmatch(option_expression):
             return None
     else:
         digest = rest
