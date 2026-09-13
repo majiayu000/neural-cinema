@@ -31,8 +31,32 @@ SRI_ASCII_WHITESPACE_RE = re.compile(r"[ \t\n\r\f]+")
 SECURITY_SCRIPT_ATTRS = frozenset({"src", "href", "xlink:href", "integrity", "crossorigin"})
 # SVG elements that switch child content into the HTML namespace (HTML integration points).
 SVG_HTML_INTEGRATION_POINTS = frozenset({"foreignobject", "desc", "title"})
+# MathML text integration points (HTML namespace children; not MathML <script>).
+MATHML_HTML_INTEGRATION_POINTS = frozenset({"mi", "mo", "mn", "ms", "mtext"})
+MATHML_ANNOTATION_XML_HTML_ENCODINGS = frozenset({"text/html", "application/xhtml+xml"})
+# Classic JavaScript MIME types plus the empty/missing type default and module.
+JAVASCRIPT_MIME_TYPES = frozenset(
+    {
+        "application/ecmascript",
+        "application/javascript",
+        "application/x-ecmascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "text/javascript",
+        "text/javascript1.0",
+        "text/javascript1.1",
+        "text/javascript1.2",
+        "text/javascript1.3",
+        "text/javascript1.4",
+        "text/javascript1.5",
+        "text/jscript",
+        "text/livescript",
+        "text/x-ecmascript",
+        "text/x-javascript",
+    }
+)
 # HTML start tags that exit SVG/MathML foreign content (WHATWG "in foreign content").
-SVG_HTML_BREAKOUT_TAGS = frozenset(
+FOREIGN_HTML_BREAKOUT_TAGS = frozenset(
     {
         "b",
         "big",
@@ -80,7 +104,7 @@ SVG_HTML_BREAKOUT_TAGS = frozenset(
         "var",
     }
 )
-SVG_HTML_BREAKOUT_FONT_ATTRS = frozenset({"color", "face", "size"})
+FOREIGN_HTML_BREAKOUT_FONT_ATTRS = frozenset({"color", "face", "size"})
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -137,8 +161,14 @@ class SiteParser(HTMLParser):
     def _in_svg_namespace(self) -> bool:
         return self._current_namespace() == "svg"
 
+    def _in_math_namespace(self) -> bool:
+        return self._current_namespace() == "math"
+
     def _in_html_namespace(self) -> bool:
         return self._current_namespace() == "html"
+
+    def _in_foreign_namespace(self) -> bool:
+        return self._current_namespace() in {"svg", "math"}
 
     def _in_inert_content(self) -> bool:
         # <template> contents are fully inert. <noscript> skips scripts but keeps links.
@@ -156,10 +186,12 @@ class SiteParser(HTMLParser):
 
     def _append_svg_title_reference(self, escaped: str, decoded: str) -> None:
         """Keep attribute charrefs; do not retokenize escaped tag delimiters."""
-        # Escaped &lt;/&gt; (and numeric equivalents) must stay escaped so they
-        # remain inert title text. Other references (e.g. &#x2e;) belong in
-        # attribute values of literal executable markup and must be preserved.
-        if decoded in "<>":
+        # Escaped &lt;/&gt;/&quot;/&#34;/&apos; (and numeric equivalents) must stay
+        # escaped so nested reparsing cannot invent new attributes from a quote
+        # that browsers keep inside the attribute value. Other references
+        # (e.g. &#x2e;) belong in attribute values of literal executable markup
+        # and must be preserved as decoded characters.
+        if decoded in "<>\"'":
             self._svg_title_buffer.append(escaped)
             return
         self._svg_title_buffer.append(decoded)
@@ -176,24 +208,47 @@ class SiteParser(HTMLParser):
         if len(self._namespaces) > 1 and self._namespaces[-1] == namespace:
             self._namespaces.pop()
 
-    def _leave_all_svg_namespaces(self) -> None:
-        """Pop every nested SVG scope, matching HTML foreign-content breakout."""
-        while self._in_svg_namespace() and len(self._namespaces) > 1:
+    def _leave_all_foreign_namespaces(self) -> None:
+        """Pop every nested SVG/MathML scope, matching HTML foreign-content breakout."""
+        while self._in_foreign_namespace() and len(self._namespaces) > 1:
             self._namespaces.pop()
 
-    def _is_svg_html_breakout(self, tag: str, values: dict[str, str | None]) -> bool:
-        """True when a start tag exits SVG foreign content into the HTML namespace."""
-        if tag in SVG_HTML_BREAKOUT_TAGS:
+    def _is_foreign_html_breakout(self, tag: str, values: dict[str, str | None]) -> bool:
+        """True when a start tag exits SVG/MathML foreign content into HTML."""
+        if tag in FOREIGN_HTML_BREAKOUT_TAGS:
             return True
         # <font> breaks out only when color/face/size is present (HTML foreign content).
-        return tag == "font" and bool(SVG_HTML_BREAKOUT_FONT_ATTRS & values.keys())
+        return tag == "font" and bool(FOREIGN_HTML_BREAKOUT_FONT_ATTRS & values.keys())
+
+    def _push_html_integration_point(self) -> None:
+        self._enter_namespace("html")
+        self._integration_point_pushed.append(True)
+
+    def _maybe_enter_mathml_html_integration(
+        self, tag: str, values: dict[str, str | None]
+    ) -> bool:
+        """Enter HTML namespace for MathML text/annotation-xml integration points."""
+        if not self._in_math_namespace():
+            return False
+        if tag in MATHML_HTML_INTEGRATION_POINTS:
+            self._push_html_integration_point()
+            return True
+        if tag == "annotation-xml":
+            encoding = ascii_lower((values.get("encoding") or "").strip())
+            if encoding in MATHML_ANNOTATION_XML_HTML_ENCODINGS:
+                self._push_html_integration_point()
+                return True
+            # Still record a stack slot so the matching end tag does not pop outer state.
+            self._integration_point_pushed.append(False)
+            return False
+        return False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
         values, duplicates = first_wins_attrs(attrs)
-        # Nested <svg><svg><p> exits every SVG scope before processing p.
-        if self._in_svg_namespace() and self._is_svg_html_breakout(tag, values):
-            self._leave_all_svg_namespaces()
+        # Nested <math>/<svg> foreign content exits every foreign scope before HTML tags.
+        if self._in_foreign_namespace() and self._is_foreign_html_breakout(tag, values):
+            self._leave_all_foreign_namespaces()
         if tag == "template":
             # Only HTML-namespace <template> is inert. SVG <template> is ordinary
             # SVG content whose descendant scripts can still execute.
@@ -220,20 +275,27 @@ class SiteParser(HTMLParser):
         entered_html_integration = False
         if tag == "svg":
             self._enter_namespace("svg")
+        elif tag == "math":
+            self._enter_namespace("math")
         elif tag in SVG_HTML_INTEGRATION_POINTS:
             # foreignObject, desc, and title are SVG HTML integration points.
             # Only push when currently in SVG; nested HTML-namespace copies must
             # not push, but still record False so their end tags do not pop the
             # outer integration-point namespace.
             if self._in_svg_namespace():
-                self._enter_namespace("html")
-                self._integration_point_pushed.append(True)
+                self._push_html_integration_point()
                 entered_html_integration = True
                 if tag == "title":
                     # html.parser keeps title contents as text; flag for re-parse.
                     self._svg_title_buffer.clear()
                     self._svg_title_integration = True
             else:
+                self._integration_point_pushed.append(False)
+        elif tag in MATHML_HTML_INTEGRATION_POINTS or tag == "annotation-xml":
+            if self._maybe_enter_mathml_html_integration(tag, values):
+                entered_html_integration = True
+            elif not self._in_math_namespace():
+                # Matching end tags must not pop an outer integration-point state.
                 self._integration_point_pushed.append(False)
         if tag == "title" and self._in_html_namespace() and not entered_html_integration:
             # Document <title> only; SVG <title> is an integration point, not the page title.
@@ -269,6 +331,12 @@ class SiteParser(HTMLParser):
                 nested.feed(srcdoc)
                 self._merge_nested_document(nested)
         if tag == "script":
+            # MathML-namespace <script> has no HTML script-fetching behavior.
+            if self._in_math_namespace():
+                return
+            # Non-JS MIME types are data blocks: browsers do not fetch/execute src.
+            if not is_executable_script_type(values.get("type")):
+                return
             src = script_resource_url(values, self._in_svg_namespace())
             if src:
                 resolved_src = resolve_reference(src, self._active_base())
@@ -308,8 +376,15 @@ class SiteParser(HTMLParser):
             if self._integration_point_pushed and self._integration_point_pushed.pop():
                 self._leave_namespace("html")
             return
+        if tag in MATHML_HTML_INTEGRATION_POINTS or tag == "annotation-xml":
+            if self._integration_point_pushed and self._integration_point_pushed.pop():
+                self._leave_namespace("html")
+            return
         if tag == "svg":
             self._leave_namespace("svg")
+            return
+        if tag == "math":
+            self._leave_namespace("math")
             return
 
     def handle_data(self, data: str) -> None:
@@ -411,10 +486,26 @@ def script_resource_url(values: dict[str, str | None], in_svg: bool) -> str | No
 
     SVG scripts fetch href/xlink:href; HTML scripts use src. Preferring HTML src
     inside SVG would miss an external href attack that the browser still loads.
+    A present empty ``href`` still wins over ``xlink:href`` (browser precedence).
     """
     if in_svg:
-        return values.get("href") or values.get("xlink:href")
+        if "href" in values:
+            return values.get("href")
+        if "xlink:href" in values:
+            return values.get("xlink:href")
+        return None
     return values.get("src")
+
+
+def is_executable_script_type(script_type: str | None) -> bool:
+    """True when a script element is classic/module JS rather than a data block."""
+    if script_type is None:
+        return True
+    lowered = ascii_lower(script_type.strip())
+    if not lowered:
+        return True
+    mime = lowered.split(";", 1)[0].strip()
+    return mime == "module" or mime in JAVASCRIPT_MIME_TYPES
 
 
 def strip_url_fragment(url: str) -> str:
@@ -438,10 +529,12 @@ def is_anonymous_crossorigin(crossorigin: str | None) -> bool:
 
     HTML CORS settings treat a missing/empty value and any keyword other than
     ``use-credentials`` (including invalid values) as the anonymous state.
+    Matching is ASCII case-insensitive; Unicode casefold must not forge the
+    credentials keyword (e.g. U+017F long s).
     """
     if crossorigin is None or crossorigin == "":
         return True
-    return crossorigin.casefold() != "use-credentials"
+    return ascii_lower(crossorigin) != "use-credentials"
 
 
 def pad_base64(digest: str) -> str:
