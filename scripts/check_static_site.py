@@ -113,14 +113,19 @@ FOREIGN_HTML_BREAKOUT_FONT_ATTRS = frozenset({"color", "face", "size"})
 # and textarea/title as RCDATA; plaintext is a separate hardcoded RAWTEXT mode.
 # In SVG/MathML foreign content those elements are ordinary markup, so nested
 # tags (e.g. <svg><style><script href> or <svg><textarea><script href>) must be
-# retokenized rather than swallowed. Keep title as RCDATA in foreign content so
-# SVG <title> buffering still sees the full RCDATA run.
+# retokenized rather than swallowed. Keep title as RCDATA only in SVG so SVG
+# <title> buffering still sees the full RCDATA run; MathML <title> is ordinary
+# foreign markup (HTML breakout tags inside it must still be tokenized).
+# getattr keeps import working on Python builds that lack the 3.12+ attribute.
 _HTML_CDATA_CONTENT_ELEMENTS = HTMLParser.CDATA_CONTENT_ELEMENTS
 _FOREIGN_CDATA_CONTENT_ELEMENTS: tuple[str, ...] = ()
-_HTML_RCDATA_CONTENT_ELEMENTS = HTMLParser.RCDATA_CONTENT_ELEMENTS
-_FOREIGN_RCDATA_CONTENT_ELEMENTS = tuple(
-    name for name in HTMLParser.RCDATA_CONTENT_ELEMENTS if name != "textarea"
+_HTML_RCDATA_CONTENT_ELEMENTS = getattr(
+    HTMLParser, "RCDATA_CONTENT_ELEMENTS", ("textarea", "title")
 )
+_FOREIGN_RCDATA_SVG_CONTENT_ELEMENTS = tuple(
+    name for name in _HTML_RCDATA_CONTENT_ELEMENTS if name != "textarea"
+)
+_FOREIGN_RCDATA_MATH_CONTENT_ELEMENTS: tuple[str, ...] = ()
 # Document URL used as the initial base for top-level HTML (matches browsers).
 DOCUMENT_URL = "index.html"
 DECLARATIVE_SHADOW_ROOT_MODES = frozenset({"open", "closed"})
@@ -204,6 +209,9 @@ class SiteParser(HTMLParser):
         # Declarative shadow roots are active, but <base> inside them is not the
         # document base URL. Track depth so shadow <base> cannot leak outward.
         self._shadow_root_depth = 0
+        # Stack of template kinds ("inert" | "shadow") so nested close tags
+        # decrement the matching open kind rather than aggregate depths.
+        self._template_kinds: list[str] = []
         # True when the matching mglyph/malignmark start tag entered MathML.
         self._mathml_exception_entered: list[bool] = []
         # Track HTML vs SVG namespace so foreignObject/desc/title HTML scripts use src.
@@ -326,17 +334,33 @@ class SiteParser(HTMLParser):
         if len(self._namespaces) > 1 and self._namespaces[-1] == namespace:
             self._namespaces.pop()
 
+    def _leave_html_integration_namespace(self) -> None:
+        """Pop nested foreign scopes inside an HTML integration point, then HTML.
+
+        Closing ``</desc>`` / ``</foreignobject>`` must also pop SVG/MathML
+        namespaces entered under that integration point (e.g. ``<desc><math>``),
+        matching the HTML tree builder's ancestor-end-tag unwind.
+        """
+        while len(self._namespaces) > 1 and self._namespaces[-1] in {"svg", "math"}:
+            self._namespaces.pop()
+        self._leave_namespace("html")
+
     def _leave_foreign_element(self, namespace: str) -> None:
         """Pop through HTML integration scopes until the matching foreign element.
 
         Ancestor end tags such as ``</svg>`` inside ``foreignObject`` pop both the
         integration-point HTML scope and the SVG element (HTML foreign-content rules).
+        Nested foreign namespaces under those scopes (e.g. MathML inside ``desc``)
+        are unwound as well.
         """
         while len(self._namespaces) > 1:
             current = self._namespaces[-1]
             if current == namespace:
                 self._namespaces.pop()
                 return
+            if current in {"svg", "math"}:
+                self._namespaces.pop()
+                continue
             if current != "html":
                 return
             # Drain non-pushing integration markers nested under this HTML scope.
@@ -400,7 +424,11 @@ class SiteParser(HTMLParser):
         Example: ``<svg><desc><foreignobject></desc>`` — ``</desc>`` pops both the
         HTML-namespace ``foreignobject`` marker and the ``desc`` HTML scope so a
         following SVG ``<script href>`` is not misread as HTML ``src``.
+        Unmatched end tags (e.g. ``</title>`` with only a ``desc`` marker) are
+        ignored, matching the browser, so they do not drain unrelated scopes.
         """
+        if tag not in self._integration_point_tags:
+            return
         while self._integration_point_tags:
             marker_tag = self._integration_point_tags[-1]
             if marker_tag == "title" and self._svg_title_integration:
@@ -408,7 +436,7 @@ class SiteParser(HTMLParser):
                 self._svg_title_integration = False
                 self._in_title = False
             if self._pop_integration_point():
-                self._leave_namespace("html")
+                self._leave_html_integration_namespace()
             if marker_tag == tag:
                 break
 
@@ -459,10 +487,14 @@ class SiteParser(HTMLParser):
             self._leave_all_foreign_namespaces()
         # Foreign-namespace rawtext/CDATA/RCDATA elements are ordinary markup;
         # retokenize nested tags. HTML keeps CDATA/RCDATA so script/style/iframe
-        # and textarea bodies stay text. SVG <title> remains RCDATA for buffering.
+        # and textarea bodies stay text. SVG <title> remains RCDATA for buffering;
+        # MathML <title> does not (ordinary foreign element).
         if self._in_foreign_namespace():
             self.CDATA_CONTENT_ELEMENTS = _FOREIGN_CDATA_CONTENT_ELEMENTS
-            self.RCDATA_CONTENT_ELEMENTS = _FOREIGN_RCDATA_CONTENT_ELEMENTS
+            if self._in_svg_namespace():
+                self.RCDATA_CONTENT_ELEMENTS = _FOREIGN_RCDATA_SVG_CONTENT_ELEMENTS
+            else:
+                self.RCDATA_CONTENT_ELEMENTS = _FOREIGN_RCDATA_MATH_CONTENT_ELEMENTS
         else:
             self.CDATA_CONTENT_ELEMENTS = _HTML_CDATA_CONTENT_ELEMENTS
             self.RCDATA_CONTENT_ELEMENTS = _HTML_RCDATA_CONTENT_ELEMENTS
@@ -470,11 +502,16 @@ class SiteParser(HTMLParser):
             # Only HTML-namespace <template> is inert. Declarative shadow roots
             # (shadowrootmode=open|closed) attach and run parser-inserted scripts.
             # SVG <template> is ordinary SVG content whose descendants can execute.
-            if self._in_html_namespace() and is_declarative_shadow_root(values):
-                self._shadow_root_depth += 1
-            elif self._in_html_namespace():
-                self._template_depth += 1
-                return
+            # Nested templates inside an inert <template> stay inert even when they
+            # carry shadowrootmode (browser does not attach until the host is live).
+            if self._in_html_namespace():
+                if is_declarative_shadow_root(values) and self._template_depth == 0:
+                    self._template_kinds.append("shadow")
+                    self._shadow_root_depth += 1
+                else:
+                    self._template_kinds.append("inert")
+                    self._template_depth += 1
+                    return
         if tag == "noscript":
             # Noscript fallback scripts never execute. Only the HTML element
             # participates; SVG-namespaced noscript is not a noscript context.
@@ -629,11 +666,16 @@ class SiteParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "template":
-            if self._template_depth > 0:
-                self._template_depth -= 1
+            if not self._template_kinds:
                 return
-            if self._shadow_root_depth > 0:
-                self._shadow_root_depth -= 1
+            kind = self._template_kinds.pop()
+            if kind == "inert":
+                if self._template_depth > 0:
+                    self._template_depth -= 1
+                return
+            if kind == "shadow":
+                if self._shadow_root_depth > 0:
+                    self._shadow_root_depth -= 1
                 self._pop_open_tag(tag)
             return
         if tag == "noscript":
@@ -739,6 +781,27 @@ def is_external(reference: str) -> bool:
     return reference.startswith("///")
 
 
+def can_be_a_base_url(url: str) -> bool:
+    """True when ``url`` can serve as a hierarchical base for relative references.
+
+    Opaque-path URLs such as ``mailto:`` / ``data:`` / ``javascript:`` are valid
+    ``<base href>`` values but cannot resolve relative refs; ``urljoin`` would
+    otherwise return the relative string unchanged and falsely accept a local file.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    scheme = ascii_lower(parsed.scheme) if parsed.scheme else ""
+    if not scheme:
+        # Document-relative bases (e.g. index.html) remain hierarchical.
+        return True
+    if scheme in {"http", "https", "ws", "wss", "ftp", "file"}:
+        return True
+    # Non-special schemes require an authority component to be a base URL.
+    return bool(parsed.netloc)
+
+
 def resolve_reference(reference: str, base_href: str | None) -> str:
     """Resolve a document-relative URL against the active <base href>, if any.
 
@@ -758,6 +821,16 @@ def resolve_reference(reference: str, base_href: str | None) -> str:
     if not base_href:
         return ref
     base = base_href.replace("\\", "/")
+    if not can_be_a_base_url(base):
+        # Absolute/network-path refs still stand alone; relative refs cannot
+        # resolve and must not be mistaken for repository-local paths.
+        try:
+            ref_parsed = urlparse(ref)
+        except ValueError:
+            return f"__unresolved_opaque_base__/{ref}"
+        if ref_parsed.scheme or ref.startswith("//"):
+            return ref
+        return f"__unresolved_opaque_base__/{ref}"
     try:
         return urljoin(base, ref)
     except ValueError:
