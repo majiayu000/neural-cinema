@@ -135,12 +135,26 @@ def ascii_lower(value: str) -> str:
     return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in value)
 
 
-def html5_named_character(name: str) -> str | None:
+def html5_named_character(
+    name: str, *, had_semicolon: bool | None = None
+) -> str | None:
     """Resolve an HTML5 named character reference (entity name without ``&``/``;``).
 
-    Prefer the HTML5 table (covers entities like ``period`` absent from the
-    legacy ``name2codepoint`` map), then fall back to the legacy codepoints.
+    ``html.parser`` reports the same entity name for ``&num`` and ``&num;``. When
+    ``had_semicolon`` is False, only semicolonless legacy forms (bare HTML5 keys /
+    ``name2codepoint``) are decoded — inventing a trailing semicolon would turn
+    ``&num`` into ``#`` and falsely match trusted URLs after fragment stripping.
+    When ``had_semicolon`` is True or unknown, prefer the semicolon-terminated
+    HTML5 table entry (covers entities like ``period`` absent from the legacy map).
     """
+    if had_semicolon is False:
+        value = html_entities.html5.get(name)
+        if value is not None:
+            return value
+        codepoint = html_entities.name2codepoint.get(name)
+        if codepoint is not None:
+            return chr(codepoint)
+        return None
     for key in (f"{name};", name):
         value = html_entities.html5.get(key)
         if value is not None:
@@ -149,6 +163,24 @@ def html5_named_character(name: str) -> str | None:
     if codepoint is not None:
         return chr(codepoint)
     return None
+
+
+def decode_numeric_charref(name: str) -> str:
+    """Decode a numeric character reference; invalid code points become U+FFFD."""
+    try:
+        if name[:1].lower() == "x":
+            codepoint = int(name[1:], 16)
+        else:
+            codepoint = int(name)
+    except ValueError:
+        return "\uFFFD"
+    # HTML5: surrogates and values outside Unicode range are U+FFFD.
+    if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+        return "\uFFFD"
+    try:
+        return chr(codepoint)
+    except ValueError:
+        return "\uFFFD"
 
 
 class SiteParser(HTMLParser):
@@ -169,6 +201,8 @@ class SiteParser(HTMLParser):
         # Parallel to _integration_point_pushed: True only for MathML text IPs (mi/mo/mn/ms/mtext).
         # annotation-xml HTML IPs are HTML but must not enable the mglyph/malignmark exception.
         self._mathml_text_integration_pushed: list[bool] = []
+        # Parallel tag names so ancestor end tags can unwind nested integration markers.
+        self._integration_point_tags: list[str] = []
         # HTMLParser treats <title> as RCDATA; re-parse literal SVG <title> text as HTML.
         self._svg_title_integration = False
         # Buffer SVG <title> RCDATA (including non-delimiter charrefs) and reparse once.
@@ -322,15 +356,17 @@ class SiteParser(HTMLParser):
         # <font> breaks out only when color/face/size is present (HTML foreign content).
         return tag == "font" and bool(FOREIGN_HTML_BREAKOUT_FONT_ATTRS & values.keys())
 
-    def _push_html_integration_point(self, *, mathml_text: bool = False) -> None:
+    def _push_html_integration_point(self, tag: str, *, mathml_text: bool = False) -> None:
         self._enter_namespace("html")
         self._integration_point_pushed.append(True)
         self._mathml_text_integration_pushed.append(mathml_text)
+        self._integration_point_tags.append(tag)
 
-    def _record_integration_point_skipped(self) -> None:
+    def _record_integration_point_skipped(self, tag: str) -> None:
         """Matching end tag must not pop an outer integration-point namespace."""
         self._integration_point_pushed.append(False)
         self._mathml_text_integration_pushed.append(False)
+        self._integration_point_tags.append(tag)
 
     def _pop_integration_point(self) -> bool:
         """Pop integration-point stacks together; True if HTML namespace was pushed."""
@@ -339,7 +375,39 @@ class SiteParser(HTMLParser):
         pushed = self._integration_point_pushed.pop()
         if self._mathml_text_integration_pushed:
             self._mathml_text_integration_pushed.pop()
+        if self._integration_point_tags:
+            self._integration_point_tags.pop()
         return pushed
+
+    def _close_integration_points_through(self, tag: str) -> None:
+        """Pop nested integration markers closed by an ancestor end tag.
+
+        Example: ``<svg><desc><foreignobject></desc>`` — ``</desc>`` pops both the
+        HTML-namespace ``foreignobject`` marker and the ``desc`` HTML scope so a
+        following SVG ``<script href>`` is not misread as HTML ``src``.
+        """
+        while self._integration_point_tags:
+            marker_tag = self._integration_point_tags[-1]
+            if marker_tag == "title" and self._svg_title_integration:
+                self._flush_svg_title_buffer()
+                self._svg_title_integration = False
+                self._in_title = False
+            if self._pop_integration_point():
+                self._leave_namespace("html")
+            if marker_tag == tag:
+                break
+
+    def _named_ref_had_semicolon(self, name: str) -> bool:
+        """True when the source named reference included a terminating semicolon."""
+        lineno, offset = self.getpos()
+        lines = self.rawdata.splitlines(keepends=True)
+        if lineno < 1 or lineno > len(lines):
+            return False
+        abs_index = sum(len(lines[index]) for index in range(lineno - 1)) + offset
+        expect = f"&{name}"
+        if self.rawdata[abs_index : abs_index + len(expect)] != expect:
+            return False
+        return self.rawdata[abs_index + len(expect) : abs_index + len(expect) + 1] == ";"
 
     def _in_mathml_text_integration_point(self) -> bool:
         """True when current HTML namespace came from a MathML text IP (not annotation-xml)."""
@@ -354,17 +422,17 @@ class SiteParser(HTMLParser):
         if not self._in_math_namespace():
             return False
         if tag in MATHML_HTML_INTEGRATION_POINTS:
-            self._push_html_integration_point(mathml_text=True)
+            self._push_html_integration_point(tag, mathml_text=True)
             return True
         if tag == "annotation-xml":
             # Encoding match is ASCII case-insensitive and exact; do not strip.
             encoding = ascii_lower(values.get("encoding") or "")
             if encoding in MATHML_ANNOTATION_XML_HTML_ENCODINGS:
                 # HTML-enabled annotation-xml is an HTML IP, not a MathML text IP.
-                self._push_html_integration_point(mathml_text=False)
+                self._push_html_integration_point(tag, mathml_text=False)
                 return True
             # Still record a stack slot so the matching end tag does not pop outer state.
-            self._record_integration_point_skipped()
+            self._record_integration_point_skipped(tag)
             return False
         return False
 
@@ -431,20 +499,20 @@ class SiteParser(HTMLParser):
             # not push, but still record False so their end tags do not pop the
             # outer integration-point namespace.
             if self._in_svg_namespace():
-                self._push_html_integration_point(mathml_text=False)
+                self._push_html_integration_point(tag, mathml_text=False)
                 entered_html_integration = True
                 if tag == "title":
                     # html.parser keeps title contents as text; flag for re-parse.
                     self._svg_title_buffer.clear()
                     self._svg_title_integration = True
             else:
-                self._record_integration_point_skipped()
+                self._record_integration_point_skipped(tag)
         elif tag in MATHML_HTML_INTEGRATION_POINTS or tag == "annotation-xml":
             if self._maybe_enter_mathml_html_integration(tag, values):
                 entered_html_integration = True
             elif not self._in_math_namespace():
                 # Matching end tags must not pop an outer integration-point state.
-                self._record_integration_point_skipped()
+                self._record_integration_point_skipped(tag)
         if tag == "title" and self._in_html_namespace() and not entered_html_integration:
             # Document <title> only; SVG <title> is an integration point, not the page title.
             self._in_title = True
@@ -503,6 +571,8 @@ class SiteParser(HTMLParser):
                             "duplicate_security_attrs": sorted(
                                 duplicates & SECURITY_SCRIPT_ATTRS
                             ),
+                            # Browsers do not apply HTML SRI to SVGScriptElement fetches.
+                            "svg_script": self._in_svg_namespace(),
                         }
                     )
         self._push_open_tag(tag)
@@ -523,18 +593,17 @@ class SiteParser(HTMLParser):
             self._leave_namespace("math")
             return
         if tag in SVG_HTML_INTEGRATION_POINTS:
-            # Pop HTML namespace only when this end tag matches a start that pushed.
+            # Ancestor end tags (e.g. </desc> with a nested HTML foreignobject) must
+            # unwind every nested integration marker the tree builder would pop.
             if tag == "title":
                 if self._svg_title_integration:
                     self._flush_svg_title_buffer()
                 self._svg_title_integration = False
                 self._in_title = False
-            if self._pop_integration_point():
-                self._leave_namespace("html")
+            self._close_integration_points_through(tag)
             return
         if tag in MATHML_HTML_INTEGRATION_POINTS or tag == "annotation-xml":
-            if self._pop_integration_point():
-                self._leave_namespace("html")
+            self._close_integration_points_through(tag)
             return
         if tag == "svg":
             self._leave_foreign_element("svg")
@@ -553,12 +622,15 @@ class SiteParser(HTMLParser):
 
     def handle_entityref(self, name: str) -> None:
         if self._svg_title_integration:
-            char = html5_named_character(name)
+            had_semicolon = self._named_ref_had_semicolon(name)
+            char = html5_named_character(name, had_semicolon=had_semicolon)
             if char is not None:
-                self._append_svg_title_reference(f"&{name};", char)
+                escaped = f"&{name};" if had_semicolon else f"&{name}"
+                self._append_svg_title_reference(escaped, char)
             else:
-                # Preserve unrecognized references literally (do not drop them).
-                self._svg_title_buffer.append(f"&{name};")
+                # Preserve unrecognized / semicolonless non-legacy refs literally.
+                escaped = f"&{name};" if had_semicolon else f"&{name}"
+                self._svg_title_buffer.append(escaped)
             return
         if self._in_title:
             char = html5_named_character(name)
@@ -567,17 +639,11 @@ class SiteParser(HTMLParser):
 
     def handle_charref(self, name: str) -> None:
         if self._svg_title_integration:
-            try:
-                decoded = chr(int(name[1:], 16) if name[:1].lower() == "x" else int(name))
-            except ValueError:
-                return
+            decoded = decode_numeric_charref(name)
             self._append_svg_title_reference(f"&#{name};", decoded)
             return
         if self._in_title:
-            try:
-                self.title += chr(int(name[1:], 16) if name[:1].lower() == "x" else int(name))
-            except ValueError:
-                return
+            self.title += decode_numeric_charref(name)
 
 
 def first_wins_attrs(
@@ -620,7 +686,12 @@ def resolve_reference(reference: str, base_href: str | None) -> str:
         return reference.replace("\\", "/") if "\\" in reference else reference
     base = base_href.replace("\\", "/")
     ref = reference.replace("\\", "/")
-    return urljoin(base, ref)
+    try:
+        return urljoin(base, ref)
+    except ValueError:
+        # Malformed base/reference (e.g. https://[): browsers ignore the bad base
+        # and keep resolving against the document URL instead of aborting.
+        return ref
 
 
 def iframe_allows_scripts(has_sandbox: bool, sandbox: str | None) -> bool:
@@ -869,6 +940,13 @@ def validate_html(errors: list[str]) -> None:
         src = str(script["src"] or "")
         integrity = str(script.get("integrity") or "")
         duplicate_attrs = script.get("duplicate_security_attrs") or []
+        if script.get("svg_script"):
+            # SVGScriptElement fetches ignore HTML integrity metadata in browsers.
+            errors.append(
+                "external SVG script is forbidden "
+                f"(browsers do not enforce SRI on SVGScriptElement): {src}"
+            )
+            continue
         if duplicate_attrs:
             joined = ", ".join(str(name) for name in duplicate_attrs)
             errors.append(
