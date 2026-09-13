@@ -30,6 +30,56 @@ SRI_ASCII_WHITESPACE_RE = re.compile(r"[ \t\n\r\f]+")
 SECURITY_SCRIPT_ATTRS = frozenset({"src", "href", "xlink:href", "integrity", "crossorigin"})
 # SVG elements that switch child content into the HTML namespace (HTML integration points).
 SVG_HTML_INTEGRATION_POINTS = frozenset({"foreignobject", "desc", "title"})
+# HTML start tags that exit SVG/MathML foreign content (WHATWG "in foreign content").
+SVG_HTML_BREAKOUT_TAGS = frozenset(
+    {
+        "b",
+        "big",
+        "blockquote",
+        "body",
+        "br",
+        "center",
+        "code",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "em",
+        "embed",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "head",
+        "hr",
+        "i",
+        "img",
+        "li",
+        "listing",
+        "menu",
+        "meta",
+        "nobr",
+        "ol",
+        "p",
+        "pre",
+        "ruby",
+        "s",
+        "small",
+        "span",
+        "strong",
+        "strike",
+        "sub",
+        "sup",
+        "table",
+        "tt",
+        "u",
+        "ul",
+        "var",
+    }
+)
+SVG_HTML_BREAKOUT_FONT_ATTRS = frozenset({"color", "face", "size"})
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -92,18 +142,32 @@ class SiteParser(HTMLParser):
         if len(self._namespaces) > 1 and self._namespaces[-1] == namespace:
             self._namespaces.pop()
 
+    def _is_svg_html_breakout(self, tag: str, values: dict[str, str | None]) -> bool:
+        """True when a start tag exits SVG foreign content into the HTML namespace."""
+        if tag in SVG_HTML_BREAKOUT_TAGS:
+            return True
+        # <font> breaks out only when color/face/size is present (HTML foreign content).
+        return tag == "font" and bool(SVG_HTML_BREAKOUT_FONT_ATTRS & values.keys())
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
         values, duplicates = first_wins_attrs(attrs)
+        # <svg><p><script src=...> exits SVG before processing p; leave SVG first.
+        if self._in_svg_namespace() and self._is_svg_html_breakout(tag, values):
+            self._leave_namespace("svg")
         if tag == "template":
-            # Template contents are inert; nested templates still nest the depth.
-            self._template_depth += 1
-            return
+            # Only HTML-namespace <template> is inert. SVG <template> is ordinary
+            # SVG content whose descendant scripts can still execute.
+            if self._in_html_namespace():
+                self._template_depth += 1
+                return
         if tag == "noscript":
             # Noscript fallback is inert when scripting is enabled, and scripts
-            # cannot execute when scripting is disabled either.
-            self._noscript_depth += 1
-            return
+            # cannot execute when scripting is disabled either. Only the HTML
+            # element participates; SVG-namespaced noscript is not inert.
+            if self._in_html_namespace():
+                self._noscript_depth += 1
+                return
         if self._in_inert_content():
             # Ignore tags inside inert containers; browsers do not fetch/execute them.
             return
@@ -131,12 +195,15 @@ class SiteParser(HTMLParser):
             tag == "base"
             and self._in_html_namespace()
             and self.base_href is None
-            and values.get("href")
+            and "href" in values
         ):
             # Only HTML-namespace <base> sets the document base; SVG <base> is ignored.
+            # A present empty href resolves to the document URL and locks out later
+            # bases; only a missing href attribute is ignored.
             # Resolve against the inherited fallback so relative nested bases cannot
             # hide external scripts as local repository paths.
-            self.base_href = resolve_reference(values["href"], self._fallback_base)
+            href = values["href"] or ""
+            self.base_href = resolve_reference(href, self._fallback_base)
         if tag == "meta" and values.get("name") == "description":
             self.meta_description = values.get("content") or ""
         if tag == "canvas" and values.get("id"):
@@ -242,8 +309,14 @@ def iframe_allows_scripts(has_sandbox: bool, sandbox: str | None) -> bool:
     """True when an iframe may execute scripts (no sandbox, or allow-scripts)."""
     if not has_sandbox:
         return True
-    # HTML sandbox keywords are ASCII case-insensitive in browsers.
-    tokens = (sandbox or "").casefold().split()
+    # HTML sandbox keywords are ASCII case-insensitive and split only on ASCII
+    # whitespace. NBSP (and other Unicode spaces) do not separate tokens, so
+    # `allow-scripts\u00a0foo` is one unrecognized token and scripts stay disabled.
+    tokens = [
+        token
+        for token in SRI_ASCII_WHITESPACE_RE.split((sandbox or "").casefold())
+        if token
+    ]
     return "allow-scripts" in tokens
 
 
