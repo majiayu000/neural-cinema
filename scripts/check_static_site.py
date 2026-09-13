@@ -295,9 +295,7 @@ class SiteParser(HTMLParser):
         if self._svg_title_integration:
             return
         if self._in_title:
-            from html import entities
-
-            char = entities.name2codepoint.get(name)
+            char = html_entities.name2codepoint.get(name)
             if char is not None:
                 self.title += chr(char)
 
