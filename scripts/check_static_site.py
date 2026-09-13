@@ -109,11 +109,18 @@ FOREIGN_HTML_BREAKOUT_TAGS = frozenset(
     }
 )
 FOREIGN_HTML_BREAKOUT_FONT_ATTRS = frozenset({"color", "face", "size"})
-# HTMLParser treats script/style/xmp/iframe/noembed/noframes as rawtext/CDATA.
+# HTMLParser treats script/style/xmp/iframe/noembed/noframes as rawtext/CDATA
+# and textarea/title as RCDATA; plaintext is a separate hardcoded RAWTEXT mode.
 # In SVG/MathML foreign content those elements are ordinary markup, so nested
-# tags (e.g. <svg><style><script href>) must be retokenized rather than swallowed.
+# tags (e.g. <svg><style><script href> or <svg><textarea><script href>) must be
+# retokenized rather than swallowed. Keep title as RCDATA in foreign content so
+# SVG <title> buffering still sees the full RCDATA run.
 _HTML_CDATA_CONTENT_ELEMENTS = HTMLParser.CDATA_CONTENT_ELEMENTS
 _FOREIGN_CDATA_CONTENT_ELEMENTS: tuple[str, ...] = ()
+_HTML_RCDATA_CONTENT_ELEMENTS = HTMLParser.RCDATA_CONTENT_ELEMENTS
+_FOREIGN_RCDATA_CONTENT_ELEMENTS = tuple(
+    name for name in HTMLParser.RCDATA_CONTENT_ELEMENTS if name != "textarea"
+)
 # Document URL used as the initial base for top-level HTML (matches browsers).
 DOCUMENT_URL = "index.html"
 DECLARATIVE_SHADOW_ROOT_MODES = frozenset({"open", "closed"})
@@ -194,6 +201,11 @@ class SiteParser(HTMLParser):
         self._in_title = False
         self._template_depth = 0
         self._noscript_depth = 0
+        # Declarative shadow roots are active, but <base> inside them is not the
+        # document base URL. Track depth so shadow <base> cannot leak outward.
+        self._shadow_root_depth = 0
+        # True when the matching mglyph/malignmark start tag entered MathML.
+        self._mathml_exception_entered: list[bool] = []
         # Track HTML vs SVG namespace so foreignObject/desc/title HTML scripts use src.
         self._namespaces: list[str] = ["html"]
         # Open start tags (non-inert) so MathML→SVG applies only under annotation-xml.
@@ -301,6 +313,7 @@ class SiteParser(HTMLParser):
         # Do not propagate bases from separate iframe srcdoc documents.
         if (
             propagate_base
+            and self._shadow_root_depth == 0
             and self.base_href is None
             and nested.base_href is not None
         ):
@@ -444,17 +457,22 @@ class SiteParser(HTMLParser):
         # Nested <math>/<svg> foreign content exits every foreign scope before HTML tags.
         if self._in_foreign_namespace() and self._is_foreign_html_breakout(tag, values):
             self._leave_all_foreign_namespaces()
-        # Foreign-namespace rawtext/CDATA elements are ordinary markup; retokenize
-        # nested tags. HTML keeps CDATA so script/style/iframe bodies stay text.
+        # Foreign-namespace rawtext/CDATA/RCDATA elements are ordinary markup;
+        # retokenize nested tags. HTML keeps CDATA/RCDATA so script/style/iframe
+        # and textarea bodies stay text. SVG <title> remains RCDATA for buffering.
         if self._in_foreign_namespace():
             self.CDATA_CONTENT_ELEMENTS = _FOREIGN_CDATA_CONTENT_ELEMENTS
+            self.RCDATA_CONTENT_ELEMENTS = _FOREIGN_RCDATA_CONTENT_ELEMENTS
         else:
             self.CDATA_CONTENT_ELEMENTS = _HTML_CDATA_CONTENT_ELEMENTS
+            self.RCDATA_CONTENT_ELEMENTS = _HTML_RCDATA_CONTENT_ELEMENTS
         if tag == "template":
             # Only HTML-namespace <template> is inert. Declarative shadow roots
             # (shadowrootmode=open|closed) attach and run parser-inserted scripts.
             # SVG <template> is ordinary SVG content whose descendants can execute.
-            if self._in_html_namespace() and not is_declarative_shadow_root(values):
+            if self._in_html_namespace() and is_declarative_shadow_root(values):
+                self._shadow_root_depth += 1
+            elif self._in_html_namespace():
                 self._template_depth += 1
                 return
         if tag == "noscript":
@@ -472,6 +490,7 @@ class SiteParser(HTMLParser):
             if (
                 tag == "base"
                 and self._in_html_namespace()
+                and self._shadow_root_depth == 0
                 and self.base_href is None
                 and "href" in values
             ):
@@ -509,6 +528,11 @@ class SiteParser(HTMLParser):
                 and self._in_mathml_text_integration_point()
             ):
                 self._enter_namespace("math")
+                self._mathml_exception_entered.append(True)
+            else:
+                # End tag must not pop the surrounding MathML scope unless this
+                # start tag actually entered MathML (e.g. mglyph in annotation-xml).
+                self._mathml_exception_entered.append(False)
         elif tag in SVG_HTML_INTEGRATION_POINTS:
             # foreignObject, desc, and title are SVG HTML integration points.
             # Only push when currently in SVG; nested HTML-namespace copies must
@@ -535,6 +559,7 @@ class SiteParser(HTMLParser):
         if (
             tag == "base"
             and self._in_html_namespace()
+            and self._shadow_root_depth == 0
             and self.base_href is None
             and "href" in values
         ):
@@ -595,10 +620,21 @@ class SiteParser(HTMLParser):
                     )
         self._push_open_tag(tag)
 
+    def set_cdata_mode(self, elem: str, *, escapable: bool = False) -> None:
+        # HTMLParser hard-codes plaintext RAWTEXT independently of CDATA/RCDATA
+        # tuples. Foreign-namespace <plaintext> is ordinary markup.
+        if self._in_foreign_namespace() and elem.lower() == "plaintext":
+            return
+        super().set_cdata_mode(elem, escapable=escapable)
+
     def handle_endtag(self, tag: str) -> None:
         if tag == "template":
             if self._template_depth > 0:
                 self._template_depth -= 1
+                return
+            if self._shadow_root_depth > 0:
+                self._shadow_root_depth -= 1
+                self._pop_open_tag(tag)
             return
         if tag == "noscript":
             if self._noscript_depth > 0:
@@ -608,7 +644,13 @@ class SiteParser(HTMLParser):
             return
         self._pop_open_tag(tag)
         if tag in MATHML_HTML_INTEGRATION_EXCEPTIONS:
-            self._leave_namespace("math")
+            entered = (
+                self._mathml_exception_entered.pop()
+                if self._mathml_exception_entered
+                else False
+            )
+            if entered:
+                self._leave_namespace("math")
             return
         if tag in SVG_HTML_INTEGRATION_POINTS:
             # Ancestor end tags (e.g. </desc> with a nested HTML foreignobject) must
@@ -705,10 +747,17 @@ def resolve_reference(reference: str, base_href: str | None) -> str:
     not, which would otherwise keep relative scripts local while the browser
     fetches an external URL.
     """
+    ref = reference.replace("\\", "/") if "\\" in reference else reference
+    # Triple-slash forms (///host/path) are network-path URLs whose host is the
+    # first path segment. urllib treats them as absolute paths (empty netloc) and
+    # urljoin against a scheme-less document URL collapses them to /host/path,
+    # which can then look like a local repository file. Normalize to //host/path
+    # before joining so classification and https bases match browser behavior.
+    if ref.startswith("///"):
+        ref = ref[1:]
     if not base_href:
-        return reference.replace("\\", "/") if "\\" in reference else reference
+        return ref
     base = base_href.replace("\\", "/")
-    ref = reference.replace("\\", "/")
     try:
         return urljoin(base, ref)
     except ValueError:
@@ -755,7 +804,9 @@ def is_declarative_shadow_root(values: dict[str, str | None]) -> bool:
     mode = values.get("shadowrootmode")
     if mode is None:
         return False
-    return ascii_lower(mode.strip(ASCII_WHITESPACE)) in DECLARATIVE_SHADOW_ROOT_MODES
+    # HTML attribute matching for shadowrootmode is ASCII case-insensitive and
+    # exact; surrounding whitespace is not stripped, so " open " stays inert.
+    return ascii_lower(mode) in DECLARATIVE_SHADOW_ROOT_MODES
 
 
 def effective_script_type(values: dict[str, str | None]) -> str | None:
