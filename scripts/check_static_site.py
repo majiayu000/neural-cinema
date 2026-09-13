@@ -40,7 +40,7 @@ TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
 
 
 class SiteParser(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, fallback_base: str | None = None) -> None:
         super().__init__()
         self.title = ""
         self._in_title = False
@@ -49,15 +49,25 @@ class SiteParser(HTMLParser):
         self._svg_depth = 0
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
+        # Explicit HTML <base href>; fallback_base is used for about:srcdoc inheritance.
         self.base_href: str | None = None
+        self._fallback_base = fallback_base
         # (raw, resolved_at_encounter) so later <base> cannot rewrite earlier refs.
         self.link_refs: list[tuple[str, str]] = []
         self.script_refs: list[tuple[str, str]] = []
         self.external_scripts: list[dict[str, object]] = []
 
+    def _active_base(self) -> str | None:
+        return self.base_href if self.base_href is not None else self._fallback_base
+
     def _in_inert_content(self) -> bool:
         # <template> and <noscript> contents are not executable dependencies.
         return self._template_depth > 0 or self._noscript_depth > 0
+
+    def _merge_nested_document(self, nested: SiteParser) -> None:
+        self.link_refs.extend(nested.link_refs)
+        self.script_refs.extend(nested.script_refs)
+        self.external_scripts.extend(nested.external_scripts)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
@@ -78,8 +88,13 @@ class SiteParser(HTMLParser):
             self._svg_depth += 1
         if tag == "title":
             self._in_title = True
-        if tag == "base" and self.base_href is None and values.get("href"):
-            # HTML uses the first <base href>; later bases are ignored.
+        if (
+            tag == "base"
+            and self._svg_depth == 0
+            and self.base_href is None
+            and values.get("href")
+        ):
+            # Only HTML-namespace <base> sets the document base; SVG <base> is ignored.
             # Encounter-time resolution still matters for classic scripts before it.
             self.base_href = values["href"]
         if tag == "meta" and values.get("name") == "description":
@@ -88,12 +103,19 @@ class SiteParser(HTMLParser):
             self.canvas_ids.add(values["id"])
         if tag == "link" and values.get("href"):
             href = values["href"]
-            resolved = resolve_reference(href, self.base_href)
+            resolved = resolve_reference(href, self._active_base())
             self.link_refs.append((href, resolved))
+        if tag == "iframe":
+            srcdoc = values.get("srcdoc")
+            if srcdoc and iframe_allows_scripts("sandbox" in values, values.get("sandbox")):
+                # about:srcdoc inherits the embedding document's base URL.
+                nested = SiteParser(fallback_base=self._active_base())
+                nested.feed(srcdoc)
+                self._merge_nested_document(nested)
         if tag == "script":
             src = script_resource_url(values, self._svg_depth > 0)
             if src:
-                resolved_src = resolve_reference(src, self.base_href)
+                resolved_src = resolve_reference(src, self._active_base())
                 self.script_refs.append((src, resolved_src))
                 if is_external(resolved_src):
                     self.external_scripts.append(
@@ -158,14 +180,31 @@ def resolve_reference(reference: str, base_href: str | None) -> str:
     return urljoin(base_href, reference)
 
 
+def iframe_allows_scripts(has_sandbox: bool, sandbox: str | None) -> bool:
+    """True when an iframe may execute scripts (no sandbox, or allow-scripts)."""
+    if not has_sandbox:
+        return True
+    tokens = (sandbox or "").split()
+    return "allow-scripts" in tokens
+
+
 def script_resource_url(values: dict[str, str | None], in_svg: bool) -> str | None:
-    """Return the executable script URL for HTML src or SVG href/xlink:href."""
-    src = values.get("src")
-    if src:
-        return src
+    """Return the executable script URL for HTML src or SVG href/xlink:href.
+
+    SVG scripts fetch href/xlink:href; HTML scripts use src. Preferring HTML src
+    inside SVG would miss an external href attack that the browser still loads.
+    """
     if in_svg:
         return values.get("href") or values.get("xlink:href")
-    return None
+    return values.get("src")
+
+
+def strip_url_fragment(url: str) -> str:
+    """Remove a URL fragment for trusted-map lookup; preserve query parameters."""
+    fragment_index = url.find("#")
+    if fragment_index == -1:
+        return url
+    return url[:fragment_index]
 
 
 def normalize_local_reference(reference: str) -> Path:
@@ -359,7 +398,8 @@ def validate_html(errors: list[str]) -> None:
             )
         if not is_valid_sri_integrity(integrity):
             errors.append(f"external script missing or malformed SRI integrity: {src}")
-        trusted = TRUSTED_EXTERNAL_SCRIPT_INTEGRITY.get(src)
+        # Browsers omit fragments from the request; match trusted pins without them.
+        trusted = TRUSTED_EXTERNAL_SCRIPT_INTEGRITY.get(strip_url_fragment(src))
         if trusted is None:
             errors.append(f"untrusted external script (no pinned SRI mapping): {src}")
         elif not integrity_matches_trusted(integrity, trusted):
