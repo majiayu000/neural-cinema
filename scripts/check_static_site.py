@@ -7,6 +7,7 @@ import base64
 import binascii
 import re
 import sys
+from html import entities as html_entities
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -91,9 +92,20 @@ TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
 }
 
 
+def ascii_lower(value: str) -> str:
+    """ASCII-only lowercasing (HTML ASCII case-insensitive matching).
+
+    Unicode casefold() would map characters such as U+017F (long s) onto ASCII
+    letters and incorrectly recognize sandbox tokens browsers reject.
+    """
+    return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in value)
+
+
 class SiteParser(HTMLParser):
     def __init__(self, fallback_base: str | None = None) -> None:
-        super().__init__()
+        # Keep character references as entity/charref events so SVG <title>
+        # escaped markup (&lt;script...&gt;) is not re-tokenized as real tags.
+        super().__init__(convert_charrefs=False)
         self.title = ""
         self._in_title = False
         self._template_depth = 0
@@ -102,7 +114,7 @@ class SiteParser(HTMLParser):
         self._namespaces: list[str] = ["html"]
         # Parallel stack: True when the matching start tag pushed an HTML integration namespace.
         self._integration_point_pushed: list[bool] = []
-        # HTMLParser treats <title> as RCDATA; re-parse SVG <title> text as HTML markup.
+        # HTMLParser treats <title> as RCDATA; re-parse literal SVG <title> text as HTML.
         self._svg_title_integration = False
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
@@ -142,6 +154,11 @@ class SiteParser(HTMLParser):
         if len(self._namespaces) > 1 and self._namespaces[-1] == namespace:
             self._namespaces.pop()
 
+    def _leave_all_svg_namespaces(self) -> None:
+        """Pop every nested SVG scope, matching HTML foreign-content breakout."""
+        while self._in_svg_namespace() and len(self._namespaces) > 1:
+            self._namespaces.pop()
+
     def _is_svg_html_breakout(self, tag: str, values: dict[str, str | None]) -> bool:
         """True when a start tag exits SVG foreign content into the HTML namespace."""
         if tag in SVG_HTML_BREAKOUT_TAGS:
@@ -152,9 +169,9 @@ class SiteParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
         values, duplicates = first_wins_attrs(attrs)
-        # <svg><p><script src=...> exits SVG before processing p; leave SVG first.
+        # Nested <svg><svg><p> exits every SVG scope before processing p.
         if self._in_svg_namespace() and self._is_svg_html_breakout(tag, values):
-            self._leave_namespace("svg")
+            self._leave_all_svg_namespaces()
         if tag == "template":
             # Only HTML-namespace <template> is inert. SVG <template> is ordinary
             # SVG content whose descendant scripts can still execute.
@@ -263,8 +280,8 @@ class SiteParser(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         if self._svg_title_integration:
-            # Re-parse RCDATA title text so SVG <title> HTML integration scripts
-            # (e.g. <script src=...>) participate in SRI/trust validation.
+            # Re-parse only literal RCDATA text. Character references are handled
+            # separately and must stay inert (browsers do not retokenize them).
             if data.strip():
                 nested = SiteParser(fallback_base=self._active_base())
                 nested.feed(data)
@@ -272,6 +289,26 @@ class SiteParser(HTMLParser):
             return
         if self._in_title:
             self.title += data.strip()
+
+    def handle_entityref(self, name: str) -> None:
+        # Escaped SVG title markup must remain text; do not re-parse entity output.
+        if self._svg_title_integration:
+            return
+        if self._in_title:
+            from html import entities
+
+            char = entities.name2codepoint.get(name)
+            if char is not None:
+                self.title += chr(char)
+
+    def handle_charref(self, name: str) -> None:
+        if self._svg_title_integration:
+            return
+        if self._in_title:
+            try:
+                self.title += chr(int(name[1:], 16) if name[:1].lower() == "x" else int(name))
+            except ValueError:
+                return
 
 
 def first_wins_attrs(
@@ -299,10 +336,18 @@ def is_external(reference: str) -> bool:
 
 
 def resolve_reference(reference: str, base_href: str | None) -> str:
-    """Resolve a document-relative URL against the active <base href>, if any."""
+    """Resolve a document-relative URL against the active <base href>, if any.
+
+    Browsers treat backslashes as slashes when resolving special-scheme URLs, so
+    ``\\\\host\\dir/`` becomes a network-path base. ``urllib.parse.urljoin`` does
+    not, which would otherwise keep relative scripts local while the browser
+    fetches an external URL.
+    """
     if not base_href:
-        return reference
-    return urljoin(base_href, reference)
+        return reference.replace("\\", "/") if "\\" in reference else reference
+    base = base_href.replace("\\", "/")
+    ref = reference.replace("\\", "/")
+    return urljoin(base, ref)
 
 
 def iframe_allows_scripts(has_sandbox: bool, sandbox: str | None) -> bool:
@@ -312,9 +357,11 @@ def iframe_allows_scripts(has_sandbox: bool, sandbox: str | None) -> bool:
     # HTML sandbox keywords are ASCII case-insensitive and split only on ASCII
     # whitespace. NBSP (and other Unicode spaces) do not separate tokens, so
     # `allow-scripts\u00a0foo` is one unrecognized token and scripts stay disabled.
+    # Use ASCII lowercasing, not Unicode casefold(), so U+017F does not forge
+    # allow-scripts.
     tokens = [
         token
-        for token in SRI_ASCII_WHITESPACE_RE.split((sandbox or "").casefold())
+        for token in SRI_ASCII_WHITESPACE_RE.split(ascii_lower(sandbox or ""))
         if token
     ]
     return "allow-scripts" in tokens
@@ -397,22 +444,19 @@ def sri_algorithm_and_digest(token: str) -> tuple[str, str] | None:
 
 
 def recognized_sri_algorithm(token: str) -> str | None:
-    """Return known algorithm when digest is Base64-shaped, ignoring length.
+    """Return known algorithm when digest is ABNF Base64-shaped, ignoring length.
 
     Browsers select the strongest recognized algorithm before validating digest
-    length, so short tokens like sha512-AA== still win over sha384. Option
-    suffixes such as ?foo are parsed off before the Base64 check.
+    length, so short tokens like sha512-A or sha512-AA== still win over sha384.
+    Option suffixes such as ?foo are parsed off before the Base64 alphabet check.
+    Do not require b64decode(validate=True): lengths congruent to 1 mod 4 are
+    still syntactically valid ``base64-value`` tokens for algorithm selection.
     """
     parsed = sri_algorithm_and_digest(token)
     if parsed is None:
         return None
     algorithm, digest = parsed
     if not SRI_BASE64_RE.fullmatch(digest):
-        return None
-    padded = pad_base64(digest)
-    try:
-        base64.b64decode(padded, validate=True)
-    except binascii.Error:
         return None
     return algorithm
 
