@@ -134,6 +134,34 @@ _SET_CDATA_MODE_ACCEPTS_ESCAPABLE = (
 # Document URL used as the initial base for top-level HTML (matches browsers).
 DOCUMENT_URL = "index.html"
 DECLARATIVE_SHADOW_ROOT_MODES = frozenset({"open", "closed"})
+# WHATWG valid shadow host names for declarative shadow roots / attachShadow.
+# Autonomous custom elements (names containing '-') are also eligible.
+VALID_SHADOW_HOST_NAMES = frozenset(
+    {
+        "article",
+        "aside",
+        "blockquote",
+        "body",
+        "div",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "main",
+        "nav",
+        "p",
+        "section",
+        "span",
+    }
+)
+# When scripting is enabled, HTML <noscript> is RAWTEXT like <style>/<script>.
+_HTML_CDATA_WITH_NOSCRIPT = tuple(
+    dict.fromkeys((*_HTML_CDATA_CONTENT_ELEMENTS, "noscript"))
+)
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -518,7 +546,13 @@ class SiteParser(HTMLParser):
             else:
                 self.RCDATA_CONTENT_ELEMENTS = _FOREIGN_RCDATA_MATH_CONTENT_ELEMENTS
         else:
-            self.CDATA_CONTENT_ELEMENTS = _HTML_CDATA_CONTENT_ELEMENTS
+            # Scripting-enabled HTML treats <noscript> as RAWTEXT so nested tags
+            # (including a nested <noscript>) are text until the first </noscript>.
+            self.CDATA_CONTENT_ELEMENTS = (
+                _HTML_CDATA_WITH_NOSCRIPT
+                if self._scripts_enabled
+                else _HTML_CDATA_CONTENT_ELEMENTS
+            )
             self.RCDATA_CONTENT_ELEMENTS = _HTML_RCDATA_CONTENT_ELEMENTS
         if tag == "template":
             # Only HTML-namespace <template> is inert. Declarative shadow roots
@@ -526,8 +560,14 @@ class SiteParser(HTMLParser):
             # SVG <template> is ordinary SVG content whose descendants can execute.
             # Nested templates inside an inert <template> stay inert even when they
             # carry shadowrootmode (browser does not attach until the host is live).
+            # Attachment also requires an eligible shadow host; otherwise the
+            # template stays an ordinary inert template element.
             if self._in_html_namespace():
-                if is_declarative_shadow_root(values) and self._template_depth == 0:
+                if (
+                    is_declarative_shadow_root(values)
+                    and self._template_depth == 0
+                    and can_host_declarative_shadow_root(self._current_open_tag())
+                ):
                     self._template_kinds.append("shadow")
                     self._shadow_root_depth += 1
                 else:
@@ -535,9 +575,13 @@ class SiteParser(HTMLParser):
                     self._template_depth += 1
                     return
         if tag == "noscript":
-            # Noscript fallback scripts never execute. Only the HTML element
-            # participates; SVG-namespaced noscript is not a noscript context.
+            # Only the HTML element participates; SVG-namespaced noscript is not a
+            # noscript context. With scripting enabled, RAWTEXT/CDATA consumes
+            # contents until </noscript>. With scripting disabled, nest and parse
+            # fallbacks (base/links) while skipping scripts.
             if self._in_html_namespace():
+                if self._scripts_enabled:
+                    return
                 self._noscript_depth += 1
                 return
         if self._template_depth > 0:
@@ -631,7 +675,8 @@ class SiteParser(HTMLParser):
             self.base_href = resolve_reference(href, self._fallback_base)
         if tag == "meta" and values.get("name") == "description":
             self.meta_description = values.get("content") or ""
-        if tag == "canvas" and values.get("id"):
+        if tag == "canvas" and values.get("id") and self._shadow_root_depth == 0:
+            # Shadow-tree canvases are not reachable via document.querySelector.
             self.canvas_ids.add(values["id"])
         if tag == "link" and values.get("href"):
             href = values["href"]
@@ -647,8 +692,15 @@ class SiteParser(HTMLParser):
                 allows_scripts = iframe_allows_scripts(
                     "sandbox" in values, values.get("sandbox")
                 )
+                # about:srcdoc without its own <base> resolves against the container
+                # document's fallback URL (document URL), not the container's selected
+                # <base href>.
                 nested = SiteParser(
-                    fallback_base=self._active_base(),
+                    fallback_base=(
+                        self._fallback_base
+                        if self._fallback_base is not None
+                        else DOCUMENT_URL
+                    ),
                     scripts_enabled=allows_scripts,
                 )
                 nested.feed(srcdoc)
@@ -948,6 +1000,20 @@ def is_declarative_shadow_root(values: dict[str, str | None]) -> bool:
     # HTML attribute matching for shadowrootmode is ASCII case-insensitive and
     # exact; surrounding whitespace is not stripped, so " open " stays inert.
     return ascii_lower(mode) in DECLARATIVE_SHADOW_ROOT_MODES
+
+
+def can_host_declarative_shadow_root(host_tag: str | None) -> bool:
+    """True when ``host_tag`` may attach a declarative shadow root.
+
+    Matches WHATWG valid shadow host names plus autonomous custom elements
+    (a hyphenated name). Ineligible hosts leave the template inert.
+    """
+    if host_tag is None:
+        return False
+    name = ascii_lower(host_tag)
+    if name in VALID_SHADOW_HOST_NAMES:
+        return True
+    return "-" in name
 
 
 def effective_script_type(values: dict[str, str | None]) -> str | None:
