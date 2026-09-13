@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import inspect
 import re
 import sys
 from html import entities as html_entities
@@ -126,6 +127,10 @@ _FOREIGN_RCDATA_SVG_CONTENT_ELEMENTS = tuple(
     name for name in _HTML_RCDATA_CONTENT_ELEMENTS if name != "textarea"
 )
 _FOREIGN_RCDATA_MATH_CONTENT_ELEMENTS: tuple[str, ...] = ()
+# Python 3.14+ passes escapable= to distinguish RCDATA; older HTMLParser rejects it.
+_SET_CDATA_MODE_ACCEPTS_ESCAPABLE = (
+    "escapable" in inspect.signature(HTMLParser.set_cdata_mode).parameters
+)
 # Document URL used as the initial base for top-level HTML (matches browsers).
 DOCUMENT_URL = "index.html"
 DECLARATIVE_SHADOW_ROOT_MODES = frozenset({"open", "closed"})
@@ -198,7 +203,12 @@ def decode_numeric_charref(name: str) -> str:
 
 
 class SiteParser(HTMLParser):
-    def __init__(self, fallback_base: str | None = None) -> None:
+    def __init__(
+        self,
+        fallback_base: str | None = None,
+        *,
+        scripts_enabled: bool = True,
+    ) -> None:
         # Keep character references as entity/charref events so SVG <title>
         # escaped markup (&lt;script...&gt;) is not re-tokenized as real tags.
         super().__init__(convert_charrefs=False)
@@ -234,10 +244,19 @@ class SiteParser(HTMLParser):
         # Explicit HTML <base href>; fallback_base is used for about:srcdoc inheritance.
         self.base_href: str | None = None
         self._fallback_base = fallback_base
+        # Sandboxed iframes without allow-scripts still fetch non-script resources.
+        self._scripts_enabled = scripts_enabled
         # (raw, resolved_at_encounter) so later <base> cannot rewrite earlier refs.
         self.link_refs: list[tuple[str, str]] = []
         self.script_refs: list[tuple[str, str]] = []
         self.external_scripts: list[dict[str, object]] = []
+
+    def _enter_cdata_mode(self, elem: str, *, escapable: bool = False) -> None:
+        """Call HTMLParser.set_cdata_mode with runtime-compatible arguments."""
+        if _SET_CDATA_MODE_ACCEPTS_ESCAPABLE:
+            super().set_cdata_mode(elem, escapable=escapable)
+        else:
+            super().set_cdata_mode(elem)
 
     def _active_base(self) -> str | None:
         return self.base_href if self.base_href is not None else self._fallback_base
@@ -267,7 +286,10 @@ class SiteParser(HTMLParser):
         self._svg_title_buffer.clear()
         if not markup.strip():
             return
-        nested = SiteParser(fallback_base=self._active_base())
+        nested = SiteParser(
+            fallback_base=self._active_base(),
+            scripts_enabled=self._scripts_enabled,
+        )
         # Same-document SVG-title fragments inherit a selected base lock: if the
         # outer document already chose <base>, nested <base> must not replace it.
         # Iframe srcdoc parsers keep independent base selection (no copy here).
@@ -619,15 +641,27 @@ class SiteParser(HTMLParser):
             # SVG-namespaced <iframe> does not create a nested browsing context;
             # its srcdoc is inert and must not be parsed as an executable document.
             srcdoc = values.get("srcdoc")
-            if srcdoc and iframe_allows_scripts("sandbox" in values, values.get("sandbox")):
-                # about:srcdoc inherits the embedding document's base URL.
-                nested = SiteParser(fallback_base=self._active_base())
+            if srcdoc:
+                # Sandbox without allow-scripts still parses and fetches non-script
+                # resources (stylesheets, etc.); only executable scripts are suppressed.
+                allows_scripts = iframe_allows_scripts(
+                    "sandbox" in values, values.get("sandbox")
+                )
+                nested = SiteParser(
+                    fallback_base=self._active_base(),
+                    scripts_enabled=allows_scripts,
+                )
                 nested.feed(srcdoc)
                 nested.close()
                 self._merge_nested_document(nested)
         if tag == "script":
             # MathML-namespace <script> has no HTML script-fetching behavior.
             if self._in_math_namespace():
+                self._push_open_tag(tag)
+                return
+            # Sandboxed docs without allow-scripts (and noscript) still parse markup
+            # but must not treat scripts as fetchable/executable resources.
+            if not self._scripts_enabled:
                 self._push_open_tag(tag)
                 return
             # Non-JS MIME types are data blocks: browsers do not fetch/execute src.
@@ -662,10 +696,36 @@ class SiteParser(HTMLParser):
         # tuples. Foreign-namespace <plaintext> is ordinary markup.
         if self._in_foreign_namespace() and elem.lower() == "plaintext":
             return
-        super().set_cdata_mode(elem, escapable=escapable)
+        self._enter_cdata_mode(elem, escapable=escapable)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        # HTMLParser treats /> as start+end and never enters CDATA. Browsers ignore
+        # the solidus on HTML rawtext/RCDATA elements, so keep the element open and
+        # consume following tokens as text until the real end tag. Compare against
+        # the HTML element sets: CDATA_CONTENT_ELEMENTS may still hold the foreign
+        # empty tuple from a prior SVG/MathML start tag.
+        if not self._in_foreign_namespace() and (
+            tag in _HTML_CDATA_CONTENT_ELEMENTS
+            or tag in _HTML_RCDATA_CONTENT_ELEMENTS
+            or tag == "plaintext"
+        ):
+            self.handle_starttag(tag, attrs)
+            if tag == "plaintext" or tag in _HTML_CDATA_CONTENT_ELEMENTS:
+                self._enter_cdata_mode(tag, escapable=False)
+            else:
+                self._enter_cdata_mode(tag, escapable=True)
+            return
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "template":
+            # Only HTML-namespace <template> pushes _template_kinds. SVG/MathML
+            # </template> must not pop shadow/inert state opened by an ancestor.
+            if not self._in_html_namespace():
+                if self._template_depth == 0 and self._noscript_depth == 0:
+                    self._pop_open_tag(tag)
+                return
             if not self._template_kinds:
                 return
             kind = self._template_kinds.pop()
@@ -708,10 +768,16 @@ class SiteParser(HTMLParser):
             self._close_integration_points_through(tag)
             return
         if tag == "svg":
-            self._leave_foreign_element("svg")
+            # Only leave namespaces actually entered by an SVG start tag. An
+            # svg-named token in MathML (outside annotation-xml) never entered SVG.
+            if any(namespace == "svg" for namespace in self._namespaces):
+                self._leave_foreign_element("svg")
             return
         if tag == "math":
-            self._leave_foreign_element("math")
+            # math-named elements in SVG stay in the SVG namespace; do not search
+            # for a MathML scope by popping the surrounding SVG element.
+            if any(namespace == "math" for namespace in self._namespaces):
+                self._leave_foreign_element("math")
             return
 
     def handle_data(self, data: str) -> None:
