@@ -109,6 +109,12 @@ FOREIGN_HTML_BREAKOUT_TAGS = frozenset(
     }
 )
 FOREIGN_HTML_BREAKOUT_FONT_ATTRS = frozenset({"color", "face", "size"})
+# HTMLParser treats iframe as rawtext/CDATA. Foreign-namespace <iframe> is an
+# ordinary element whose children are markup, so exclude iframe only then.
+_HTML_CDATA_CONTENT_ELEMENTS = HTMLParser.CDATA_CONTENT_ELEMENTS
+_FOREIGN_CDATA_CONTENT_ELEMENTS = tuple(
+    name for name in HTMLParser.CDATA_CONTENT_ELEMENTS if name != "iframe"
+)
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -129,6 +135,22 @@ def ascii_lower(value: str) -> str:
     return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in value)
 
 
+def html5_named_character(name: str) -> str | None:
+    """Resolve an HTML5 named character reference (entity name without ``&``/``;``).
+
+    Prefer the HTML5 table (covers entities like ``period`` absent from the
+    legacy ``name2codepoint`` map), then fall back to the legacy codepoints.
+    """
+    for key in (f"{name};", name):
+        value = html_entities.html5.get(key)
+        if value is not None:
+            return value
+    codepoint = html_entities.name2codepoint.get(name)
+    if codepoint is not None:
+        return chr(codepoint)
+    return None
+
+
 class SiteParser(HTMLParser):
     def __init__(self, fallback_base: str | None = None) -> None:
         # Keep character references as entity/charref events so SVG <title>
@@ -140,6 +162,8 @@ class SiteParser(HTMLParser):
         self._noscript_depth = 0
         # Track HTML vs SVG namespace so foreignObject/desc/title HTML scripts use src.
         self._namespaces: list[str] = ["html"]
+        # Open start tags (non-inert) so MathML→SVG applies only under annotation-xml.
+        self._open_tags: list[str] = []
         # Parallel stack: True when the matching start tag pushed an HTML integration namespace.
         self._integration_point_pushed: list[bool] = []
         # Parallel to _integration_point_pushed: True only for MathML text IPs (mi/mo/mn/ms/mtext).
@@ -188,6 +212,11 @@ class SiteParser(HTMLParser):
         if not markup.strip():
             return
         nested = SiteParser(fallback_base=self._active_base())
+        # Same-document SVG-title fragments inherit a selected base lock: if the
+        # outer document already chose <base>, nested <base> must not replace it.
+        # Iframe srcdoc parsers keep independent base selection (no copy here).
+        if self.base_href is not None:
+            nested.base_href = self.base_href
         nested.feed(markup)
         nested.close()
         self._merge_nested_document(nested, propagate_base=True)
@@ -205,10 +234,26 @@ class SiteParser(HTMLParser):
         # second time (e.g. &#38;num; → &num; → #). Other references (e.g.
         # &#x2e;) belong in attribute values of literal executable markup and
         # must be preserved as decoded characters.
-        if decoded in "<>\"'&" or decoded in ASCII_WHITESPACE:
+        if any(char in "<>\"'&" or char in ASCII_WHITESPACE for char in decoded):
             self._svg_title_buffer.append(escaped)
             return
         self._svg_title_buffer.append(decoded)
+
+    def _push_open_tag(self, tag: str) -> None:
+        self._open_tags.append(tag)
+
+    def _pop_open_tag(self, tag: str) -> None:
+        if self._open_tags and self._open_tags[-1] == tag:
+            self._open_tags.pop()
+            return
+        # End tags may close an ancestor; pop until the matching start tag.
+        for index in range(len(self._open_tags) - 1, -1, -1):
+            if self._open_tags[index] == tag:
+                del self._open_tags[index:]
+                return
+
+    def _current_open_tag(self) -> str | None:
+        return self._open_tags[-1] if self._open_tags else None
 
     def _merge_nested_document(
         self, nested: SiteParser, *, propagate_base: bool = False
@@ -329,6 +374,12 @@ class SiteParser(HTMLParser):
         # Nested <math>/<svg> foreign content exits every foreign scope before HTML tags.
         if self._in_foreign_namespace() and self._is_foreign_html_breakout(tag, values):
             self._leave_all_foreign_namespaces()
+        # Foreign-namespace <iframe> is ordinary markup; do not enter HTML rawtext mode.
+        # HTML <iframe> keeps CDATA so fallback body text is not tokenized as tags.
+        if tag == "iframe" and self._in_foreign_namespace():
+            self.CDATA_CONTENT_ELEMENTS = _FOREIGN_CDATA_CONTENT_ELEMENTS
+        else:
+            self.CDATA_CONTENT_ELEMENTS = _HTML_CDATA_CONTENT_ELEMENTS
         if tag == "template":
             # Only HTML-namespace <template> is inert. SVG <template> is ordinary
             # SVG content whose descendant scripts can still execute.
@@ -354,16 +405,20 @@ class SiteParser(HTMLParser):
             return
         entered_html_integration = False
         if tag == "svg":
-            # HTML foreign-content rules insert an SVG-namespace element for <svg>
-            # from HTML, nested SVG, or MathML (e.g. annotation-xml → svg → script).
-            if (
-                self._in_html_namespace()
-                or self._in_svg_namespace()
-                or self._in_math_namespace()
+            # SVG from HTML or nested SVG enters the SVG namespace. From MathML,
+            # only an immediate annotation-xml child switches (WHATWG foreign
+            # content); ordinary MathML keeps a MathML-namespaced "svg" token.
+            if self._in_html_namespace() or self._in_svg_namespace():
+                self._enter_namespace("svg")
+            elif (
+                self._in_math_namespace()
+                and self._current_open_tag() == "annotation-xml"
             ):
                 self._enter_namespace("svg")
         elif tag == "math":
-            if self._in_html_namespace() or self._in_math_namespace() or self._in_svg_namespace():
+            # Math from HTML/MathML enters MathML. A math-named token in SVG stays
+            # in the SVG namespace so descendant scripts still fetch href.
+            if self._in_html_namespace() or self._in_math_namespace():
                 self._enter_namespace("math")
         elif tag in MATHML_HTML_INTEGRATION_EXCEPTIONS:
             # mglyph/malignmark stay MathML only inside MathML text integration points
@@ -427,9 +482,11 @@ class SiteParser(HTMLParser):
         if tag == "script":
             # MathML-namespace <script> has no HTML script-fetching behavior.
             if self._in_math_namespace():
+                self._push_open_tag(tag)
                 return
             # Non-JS MIME types are data blocks: browsers do not fetch/execute src.
             if not is_executable_script_type(values.get("type")):
+                self._push_open_tag(tag)
                 return
             src = script_resource_url(values, self._in_svg_namespace())
             if src:
@@ -448,6 +505,7 @@ class SiteParser(HTMLParser):
                             ),
                         }
                     )
+        self._push_open_tag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "template":
@@ -460,6 +518,7 @@ class SiteParser(HTMLParser):
             return
         if self._in_inert_content():
             return
+        self._pop_open_tag(tag)
         if tag in MATHML_HTML_INTEGRATION_EXCEPTIONS:
             self._leave_namespace("math")
             return
@@ -494,14 +553,17 @@ class SiteParser(HTMLParser):
 
     def handle_entityref(self, name: str) -> None:
         if self._svg_title_integration:
-            char = html_entities.name2codepoint.get(name)
+            char = html5_named_character(name)
             if char is not None:
-                self._append_svg_title_reference(f"&{name};", chr(char))
+                self._append_svg_title_reference(f"&{name};", char)
+            else:
+                # Preserve unrecognized references literally (do not drop them).
+                self._svg_title_buffer.append(f"&{name};")
             return
         if self._in_title:
-            char = html_entities.name2codepoint.get(name)
+            char = html5_named_character(name)
             if char is not None:
-                self.title += chr(char)
+                self.title += char
 
     def handle_charref(self, name: str) -> None:
         if self._svg_title_integration:
