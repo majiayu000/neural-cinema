@@ -142,6 +142,9 @@ class SiteParser(HTMLParser):
         self._namespaces: list[str] = ["html"]
         # Parallel stack: True when the matching start tag pushed an HTML integration namespace.
         self._integration_point_pushed: list[bool] = []
+        # Parallel to _integration_point_pushed: True only for MathML text IPs (mi/mo/mn/ms/mtext).
+        # annotation-xml HTML IPs are HTML but must not enable the mglyph/malignmark exception.
+        self._mathml_text_integration_pushed: list[bool] = []
         # HTMLParser treats <title> as RCDATA; re-parse literal SVG <title> text as HTML.
         self._svg_title_integration = False
         # Buffer SVG <title> RCDATA (including non-delimiter charrefs) and reparse once.
@@ -196,10 +199,13 @@ class SiteParser(HTMLParser):
         # that browsers keep inside the attribute value. ASCII whitespace
         # references (e.g. &#9;) must also stay escaped: browsers keep the
         # decoded tab inside an unquoted attribute value, while a nested parse
-        # that inserts a raw tab would fabricate new attributes. Other
-        # references (e.g. &#x2e;) belong in attribute values of literal
-        # executable markup and must be preserved as decoded characters.
-        if decoded in "<>\"'" or decoded in ASCII_WHITESPACE:
+        # that inserts a raw tab would fabricate new attributes. Ampersand
+        # references (&amp;/&#38;) must stay escaped too: inserting a raw `&`
+        # lets the nested parser decode a following named/numeric reference a
+        # second time (e.g. &#38;num; → &num; → #). Other references (e.g.
+        # &#x2e;) belong in attribute values of literal executable markup and
+        # must be preserved as decoded characters.
+        if decoded in "<>\"'&" or decoded in ASCII_WHITESPACE:
             self._svg_title_buffer.append(escaped)
             return
         self._svg_title_buffer.append(decoded)
@@ -241,10 +247,10 @@ class SiteParser(HTMLParser):
                 return
             # Drain non-pushing integration markers nested under this HTML scope.
             while self._integration_point_pushed and not self._integration_point_pushed[-1]:
-                self._integration_point_pushed.pop()
+                self._pop_integration_point()
             if not (self._integration_point_pushed and self._integration_point_pushed[-1]):
                 return
-            self._integration_point_pushed.pop()
+            self._pop_integration_point()
             self._namespaces.pop()
             if self._svg_title_integration:
                 self._flush_svg_title_buffer()
@@ -271,9 +277,30 @@ class SiteParser(HTMLParser):
         # <font> breaks out only when color/face/size is present (HTML foreign content).
         return tag == "font" and bool(FOREIGN_HTML_BREAKOUT_FONT_ATTRS & values.keys())
 
-    def _push_html_integration_point(self) -> None:
+    def _push_html_integration_point(self, *, mathml_text: bool = False) -> None:
         self._enter_namespace("html")
         self._integration_point_pushed.append(True)
+        self._mathml_text_integration_pushed.append(mathml_text)
+
+    def _record_integration_point_skipped(self) -> None:
+        """Matching end tag must not pop an outer integration-point namespace."""
+        self._integration_point_pushed.append(False)
+        self._mathml_text_integration_pushed.append(False)
+
+    def _pop_integration_point(self) -> bool:
+        """Pop integration-point stacks together; True if HTML namespace was pushed."""
+        if not self._integration_point_pushed:
+            return False
+        pushed = self._integration_point_pushed.pop()
+        if self._mathml_text_integration_pushed:
+            self._mathml_text_integration_pushed.pop()
+        return pushed
+
+    def _in_mathml_text_integration_point(self) -> bool:
+        """True when current HTML namespace came from a MathML text IP (not annotation-xml)."""
+        return bool(
+            self._mathml_text_integration_pushed and self._mathml_text_integration_pushed[-1]
+        )
 
     def _maybe_enter_mathml_html_integration(
         self, tag: str, values: dict[str, str | None]
@@ -282,16 +309,17 @@ class SiteParser(HTMLParser):
         if not self._in_math_namespace():
             return False
         if tag in MATHML_HTML_INTEGRATION_POINTS:
-            self._push_html_integration_point()
+            self._push_html_integration_point(mathml_text=True)
             return True
         if tag == "annotation-xml":
             # Encoding match is ASCII case-insensitive and exact; do not strip.
             encoding = ascii_lower(values.get("encoding") or "")
             if encoding in MATHML_ANNOTATION_XML_HTML_ENCODINGS:
-                self._push_html_integration_point()
+                # HTML-enabled annotation-xml is an HTML IP, not a MathML text IP.
+                self._push_html_integration_point(mathml_text=False)
                 return True
             # Still record a stack slot so the matching end tag does not pop outer state.
-            self._integration_point_pushed.append(False)
+            self._record_integration_point_skipped()
             return False
         return False
 
@@ -326,20 +354,21 @@ class SiteParser(HTMLParser):
             return
         entered_html_integration = False
         if tag == "svg":
-            # Nested svg/math in a foreign namespace stay in that namespace; only an
-            # HTML-context <svg>/<math> creates a new foreign namespace element.
-            if self._in_html_namespace() or self._in_svg_namespace():
-                self._enter_namespace("svg")
-        elif tag == "math":
-            if self._in_html_namespace() or self._in_math_namespace():
-                self._enter_namespace("math")
-        elif tag in MATHML_HTML_INTEGRATION_EXCEPTIONS:
-            # mglyph/malignmark inside MathML HTML integration points stay MathML.
+            # HTML foreign-content rules insert an SVG-namespace element for <svg>
+            # from HTML, nested SVG, or MathML (e.g. annotation-xml → svg → script).
             if (
                 self._in_html_namespace()
-                and len(self._namespaces) >= 2
-                and self._namespaces[-2] == "math"
+                or self._in_svg_namespace()
+                or self._in_math_namespace()
             ):
+                self._enter_namespace("svg")
+        elif tag == "math":
+            if self._in_html_namespace() or self._in_math_namespace() or self._in_svg_namespace():
+                self._enter_namespace("math")
+        elif tag in MATHML_HTML_INTEGRATION_EXCEPTIONS:
+            # mglyph/malignmark stay MathML only inside MathML text integration points
+            # (mi/mo/mn/ms/mtext). Inside HTML-enabled annotation-xml they are HTML.
+            if self._in_html_namespace() and self._in_mathml_text_integration_point():
                 self._enter_namespace("math")
         elif tag in SVG_HTML_INTEGRATION_POINTS:
             # foreignObject, desc, and title are SVG HTML integration points.
@@ -347,20 +376,20 @@ class SiteParser(HTMLParser):
             # not push, but still record False so their end tags do not pop the
             # outer integration-point namespace.
             if self._in_svg_namespace():
-                self._push_html_integration_point()
+                self._push_html_integration_point(mathml_text=False)
                 entered_html_integration = True
                 if tag == "title":
                     # html.parser keeps title contents as text; flag for re-parse.
                     self._svg_title_buffer.clear()
                     self._svg_title_integration = True
             else:
-                self._integration_point_pushed.append(False)
+                self._record_integration_point_skipped()
         elif tag in MATHML_HTML_INTEGRATION_POINTS or tag == "annotation-xml":
             if self._maybe_enter_mathml_html_integration(tag, values):
                 entered_html_integration = True
             elif not self._in_math_namespace():
                 # Matching end tags must not pop an outer integration-point state.
-                self._integration_point_pushed.append(False)
+                self._record_integration_point_skipped()
         if tag == "title" and self._in_html_namespace() and not entered_html_integration:
             # Document <title> only; SVG <title> is an integration point, not the page title.
             self._in_title = True
@@ -441,11 +470,11 @@ class SiteParser(HTMLParser):
                     self._flush_svg_title_buffer()
                 self._svg_title_integration = False
                 self._in_title = False
-            if self._integration_point_pushed and self._integration_point_pushed.pop():
+            if self._pop_integration_point():
                 self._leave_namespace("html")
             return
         if tag in MATHML_HTML_INTEGRATION_POINTS or tag == "annotation-xml":
-            if self._integration_point_pushed and self._integration_point_pushed.pop():
+            if self._pop_integration_point():
                 self._leave_namespace("html")
             return
         if tag == "svg":
@@ -574,8 +603,12 @@ def is_executable_script_type(script_type: str | None) -> bool:
     lowered = ascii_lower(script_type.strip(ASCII_WHITESPACE))
     if not lowered:
         return True
+    # Module state is an exact ASCII case-insensitive match for "module".
+    # Parameterized values like "module;x" are not modules and not JS MIME types.
+    if lowered == "module":
+        return True
     mime = lowered.split(";", 1)[0].strip(ASCII_WHITESPACE)
-    return mime == "module" or mime in JAVASCRIPT_MIME_TYPES
+    return mime in JAVASCRIPT_MIME_TYPES
 
 
 def strip_url_fragment(url: str) -> str:
