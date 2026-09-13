@@ -28,6 +28,8 @@ SRI_OPTION_EXPRESSION_RE = re.compile(r"^[\x21-\x7E]+$")
 # SRI/HTML "split on ASCII whitespace": TAB, LF, FF, CR, SPACE (not Unicode NBSP).
 SRI_ASCII_WHITESPACE_RE = re.compile(r"[ \t\n\r\f]+")
 SECURITY_SCRIPT_ATTRS = frozenset({"src", "href", "xlink:href", "integrity", "crossorigin"})
+# SVG elements that switch child content into the HTML namespace (HTML integration points).
+SVG_HTML_INTEGRATION_POINTS = frozenset({"foreignobject", "desc", "title"})
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -46,8 +48,12 @@ class SiteParser(HTMLParser):
         self._in_title = False
         self._template_depth = 0
         self._noscript_depth = 0
-        # Track HTML vs SVG namespace so foreignObject HTML scripts use src.
+        # Track HTML vs SVG namespace so foreignObject/desc/title HTML scripts use src.
         self._namespaces: list[str] = ["html"]
+        # Parallel stack: True when the matching start tag pushed an HTML integration namespace.
+        self._integration_point_pushed: list[bool] = []
+        # HTMLParser treats <title> as RCDATA; re-parse SVG <title> text as HTML markup.
+        self._svg_title_integration = False
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
         # Explicit HTML <base href>; fallback_base is used for about:srcdoc inheritance.
@@ -101,13 +107,25 @@ class SiteParser(HTMLParser):
         if self._in_inert_content():
             # Ignore tags inside inert containers; browsers do not fetch/execute them.
             return
+        entered_html_integration = False
         if tag == "svg":
             self._enter_namespace("svg")
-        elif tag == "foreignobject" and self._in_svg_namespace():
-            # foreignObject is an HTML integration point; descendants are HTML
-            # until a nested <svg> re-enters the SVG namespace.
-            self._enter_namespace("html")
-        if tag == "title":
+        elif tag in SVG_HTML_INTEGRATION_POINTS:
+            # foreignObject, desc, and title are SVG HTML integration points.
+            # Only push when currently in SVG; nested HTML-namespace copies must
+            # not push, but still record False so their end tags do not pop the
+            # outer integration-point namespace.
+            if self._in_svg_namespace():
+                self._enter_namespace("html")
+                self._integration_point_pushed.append(True)
+                entered_html_integration = True
+                if tag == "title":
+                    # html.parser keeps title contents as text; flag for re-parse.
+                    self._svg_title_integration = True
+            else:
+                self._integration_point_pushed.append(False)
+        if tag == "title" and self._in_html_namespace() and not entered_html_integration:
+            # Document <title> only; SVG <title> is an integration point, not the page title.
             self._in_title = True
         if (
             tag == "base"
@@ -164,16 +182,27 @@ class SiteParser(HTMLParser):
             return
         if self._in_inert_content():
             return
-        if tag == "foreignobject":
-            self._leave_namespace("html")
+        if tag in SVG_HTML_INTEGRATION_POINTS:
+            # Pop HTML namespace only when this end tag matches a start that pushed.
+            if tag == "title":
+                self._svg_title_integration = False
+                self._in_title = False
+            if self._integration_point_pushed and self._integration_point_pushed.pop():
+                self._leave_namespace("html")
             return
         if tag == "svg":
             self._leave_namespace("svg")
             return
-        if tag == "title":
-            self._in_title = False
 
     def handle_data(self, data: str) -> None:
+        if self._svg_title_integration:
+            # Re-parse RCDATA title text so SVG <title> HTML integration scripts
+            # (e.g. <script src=...>) participate in SRI/trust validation.
+            if data.strip():
+                nested = SiteParser(fallback_base=self._active_base())
+                nested.feed(data)
+                self._merge_nested_document(nested)
+            return
         if self._in_title:
             self.title += data.strip()
 
@@ -194,7 +223,12 @@ def first_wins_attrs(
 
 def is_external(reference: str) -> bool:
     parsed = urlparse(reference)
-    return parsed.scheme in {"http", "https", "data"}
+    if parsed.scheme in {"http", "https", "data"}:
+        return True
+    # Network-path URLs (//host/...) have a nonempty authority and are fetched
+    # from that host even without an explicit scheme. Treat them as external so
+    # path-normalization cannot reclassify them as local repository files.
+    return bool(parsed.netloc)
 
 
 def resolve_reference(reference: str, base_href: str | None) -> str:
