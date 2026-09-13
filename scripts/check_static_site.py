@@ -9,7 +9,7 @@ import re
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,15 +44,19 @@ class SiteParser(HTMLParser):
         self._in_title = False
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
+        self.base_href: str | None = None
         self.link_hrefs: list[str] = []
         self.script_srcs: list[str] = []
-        self.external_scripts: list[dict[str, str | None]] = []
+        self.external_scripts: list[dict[str, object]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
         values, duplicates = first_wins_attrs(attrs)
         if tag == "title":
             self._in_title = True
+        if tag == "base" and self.base_href is None and values.get("href"):
+            # HTML uses the first <base href>; later bases are ignored.
+            self.base_href = values["href"]
         if tag == "meta" and values.get("name") == "description":
             self.meta_description = values.get("content") or ""
         if tag == "canvas" and values.get("id"):
@@ -62,11 +66,14 @@ class SiteParser(HTMLParser):
         if tag == "script" and values.get("src"):
             src = values["src"]
             self.script_srcs.append(src)
-            if is_external(src):
+            resolved_src = resolve_reference(src, self.base_href)
+            if is_external(resolved_src):
                 self.external_scripts.append(
                     {
-                        "src": src,
+                        "src": resolved_src,
+                        "raw_src": src,
                         "integrity": values.get("integrity"),
+                        "has_crossorigin": "crossorigin" in values,
                         "crossorigin": values.get("crossorigin"),
                         "duplicate_security_attrs": sorted(
                             duplicates & SECURITY_SCRIPT_ATTRS
@@ -102,12 +109,26 @@ def is_external(reference: str) -> bool:
     return parsed.scheme in {"http", "https", "data"}
 
 
+def resolve_reference(reference: str, base_href: str | None) -> str:
+    """Resolve a document-relative URL against the first <base href>, if any."""
+    if not base_href:
+        return reference
+    return urljoin(base_href, reference)
+
+
 def normalize_local_reference(reference: str) -> Path:
     """Resolve a local asset path and ensure it stays under the repository root."""
     path = (ROOT / reference.removeprefix("./")).resolve()
     if not path.is_relative_to(ROOT):
         raise ValueError(f"local reference escapes repository root: {reference}")
     return path
+
+
+def is_anonymous_crossorigin(crossorigin: str | None) -> bool:
+    """True for the CORS anonymous state, including the empty-value shorthand."""
+    if crossorigin is None or crossorigin == "":
+        return True
+    return crossorigin.casefold() == "anonymous"
 
 
 def pad_base64(digest: str) -> str:
@@ -128,12 +149,19 @@ def sri_algorithm_and_digest(token: str) -> tuple[str, str] | None:
 
     SRI hash expressions are ``algo-base64[?option-expression]``. Options must be
     removed before digest validation so stronger tokens with ``?foo`` still win
-    algorithm selection the way browsers do.
+    algorithm selection the way browsers do. A trailing ``?`` with an empty option
+    expression is malformed and must not be treated as a valid hash expression.
     """
     if "-" not in token:
         return None
     algorithm, rest = token.split("-", 1)
-    digest = rest.split("?", 1)[0]
+    if "?" in rest:
+        digest, option_expression = rest.split("?", 1)
+        # SRI requires a non-empty option expression after '?'.
+        if not option_expression:
+            return None
+    else:
+        digest = rest
     if algorithm not in SRI_DIGEST_BYTES or not digest:
         return None
     return algorithm, digest
@@ -251,12 +279,15 @@ def validate_html(errors: list[str]) -> None:
 
     references = parser.link_hrefs + parser.script_srcs
     for reference in references:
-        if is_external(reference):
-            if reference.startswith("http://"):
-                errors.append(f"external reference must use https: {reference}")
+        resolved = resolve_reference(reference, parser.base_href)
+        if is_external(resolved):
+            if resolved.startswith("http://"):
+                errors.append(f"external reference must use https: {resolved}")
+            # External refs (including those made external by <base href>) are
+            # validated via external_scripts / CDN policy below when they are scripts.
             continue
         try:
-            path = normalize_local_reference(reference)
+            path = normalize_local_reference(resolved)
         except ValueError as exc:
             errors.append(str(exc))
             continue
@@ -264,12 +295,11 @@ def validate_html(errors: list[str]) -> None:
             errors.append(f"local reference does not exist: {reference}")
 
     for script in parser.external_scripts:
-        src = script["src"] or ""
-        integrity = script.get("integrity") or ""
-        crossorigin = script.get("crossorigin") or ""
+        src = str(script["src"] or "")
+        integrity = str(script.get("integrity") or "")
         duplicate_attrs = script.get("duplicate_security_attrs") or []
         if duplicate_attrs:
-            joined = ", ".join(duplicate_attrs)
+            joined = ", ".join(str(name) for name in duplicate_attrs)
             errors.append(
                 f"external script has duplicate security attributes ({joined}): {src}"
             )
@@ -280,9 +310,14 @@ def validate_html(errors: list[str]) -> None:
             errors.append(f"untrusted external script (no pinned SRI mapping): {src}")
         elif not integrity_matches_trusted(integrity, trusted):
             errors.append(f"external script integrity does not match trusted digest: {src}")
-        # HTML CORS keyword matching is ASCII case-insensitive (Anonymous == anonymous).
-        if crossorigin.casefold() != "anonymous":
+        # Missing crossorigin rejects; empty value / None means anonymous (HTML CORS).
+        if not script.get("has_crossorigin"):
             errors.append(f"external script must set crossorigin=anonymous: {src}")
+        else:
+            crossorigin = script.get("crossorigin")
+            crossorigin_value = crossorigin if isinstance(crossorigin, str) or crossorigin is None else str(crossorigin)
+            if not is_anonymous_crossorigin(crossorigin_value):
+                errors.append(f"external script must set crossorigin=anonymous: {src}")
 
     forbidden_references = ["local" + "host", "127.0.0.1", "/" + "Users/"]
     for forbidden in forbidden_references:
