@@ -877,13 +877,15 @@ def resolve_reference(reference: str, base_href: str | None) -> str:
     fetches an external URL.
     """
     ref = reference.replace("\\", "/") if "\\" in reference else reference
-    # Triple-slash forms (///host/path) are network-path URLs whose host is the
-    # first path segment. urllib treats them as absolute paths (empty netloc) and
-    # urljoin against a scheme-less document URL collapses them to /host/path,
-    # which can then look like a local repository file. Normalize to //host/path
+    # Triple-slash (or more) forms (///host/path, ////host/path, …) are
+    # network-path URLs whose host is the first path segment. urllib treats them
+    # as absolute paths (empty netloc) and urljoin against a scheme-less document
+    # URL collapses them to /host/path, which can then look like a local
+    # repository file. Peeling only one slash leaves ////… as ///…, which still
+    # collapses. Normalize any run of three or more leading slashes to //host/path
     # before joining so classification and https bases match browser behavior.
     if ref.startswith("///"):
-        ref = ref[1:]
+        ref = "//" + ref.lstrip("/")
     if not base_href:
         return ref
     base = base_href.replace("\\", "/")
