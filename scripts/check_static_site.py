@@ -123,17 +123,33 @@ def split_sri_tokens(integrity: str) -> list[str]:
     return [token for token in SRI_ASCII_WHITESPACE_RE.split(integrity) if token]
 
 
+def sri_algorithm_and_digest(token: str) -> tuple[str, str] | None:
+    """Parse algorithm and Base64 digest, stripping optional SRI ?options.
+
+    SRI hash expressions are ``algo-base64[?option-expression]``. Options must be
+    removed before digest validation so stronger tokens with ``?foo`` still win
+    algorithm selection the way browsers do.
+    """
+    if "-" not in token:
+        return None
+    algorithm, rest = token.split("-", 1)
+    digest = rest.split("?", 1)[0]
+    if algorithm not in SRI_DIGEST_BYTES or not digest:
+        return None
+    return algorithm, digest
+
+
 def recognized_sri_algorithm(token: str) -> str | None:
     """Return known algorithm when digest is Base64-shaped, ignoring length.
 
     Browsers select the strongest recognized algorithm before validating digest
-    length, so short tokens like sha512-AA== still win over sha384.
+    length, so short tokens like sha512-AA== still win over sha384. Option
+    suffixes such as ?foo are parsed off before the Base64 check.
     """
-    if "-" not in token:
+    parsed = sri_algorithm_and_digest(token)
+    if parsed is None:
         return None
-    algorithm, digest = token.split("-", 1)
-    if algorithm not in SRI_DIGEST_BYTES or not digest:
-        return None
+    algorithm, digest = parsed
     if not SRI_BASE64_RE.fullmatch(digest):
         return None
     padded = pad_base64(digest)
@@ -146,10 +162,12 @@ def recognized_sri_algorithm(token: str) -> str | None:
 
 def normalize_sri_token(token: str) -> str | None:
     """Return algorithm-padded_digest for a well-formed SRI token, else None."""
-    algorithm = recognized_sri_algorithm(token)
-    if algorithm is None:
+    parsed = sri_algorithm_and_digest(token)
+    if parsed is None:
         return None
-    _, digest = token.split("-", 1)
+    algorithm, digest = parsed
+    if not SRI_BASE64_RE.fullmatch(digest):
+        return None
     expected_bytes = SRI_DIGEST_BYTES[algorithm]
     padded = pad_base64(digest)
     try:
