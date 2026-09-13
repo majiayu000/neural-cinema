@@ -116,6 +116,8 @@ class SiteParser(HTMLParser):
         self._integration_point_pushed: list[bool] = []
         # HTMLParser treats <title> as RCDATA; re-parse literal SVG <title> text as HTML.
         self._svg_title_integration = False
+        # Buffer SVG <title> RCDATA (including non-delimiter charrefs) and reparse once.
+        self._svg_title_buffer: list[str] = []
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
         # Explicit HTML <base href>; fallback_base is used for about:srcdoc inheritance.
@@ -139,8 +141,28 @@ class SiteParser(HTMLParser):
         return self._current_namespace() == "html"
 
     def _in_inert_content(self) -> bool:
-        # <template> and <noscript> contents are not executable dependencies.
+        # <template> contents are fully inert. <noscript> skips scripts but keeps links.
         return self._template_depth > 0 or self._noscript_depth > 0
+
+    def _flush_svg_title_buffer(self) -> None:
+        """Reparse buffered SVG <title> markup as one HTML fragment."""
+        markup = "".join(self._svg_title_buffer)
+        self._svg_title_buffer.clear()
+        if not markup.strip():
+            return
+        nested = SiteParser(fallback_base=self._active_base())
+        nested.feed(markup)
+        self._merge_nested_document(nested)
+
+    def _append_svg_title_reference(self, escaped: str, decoded: str) -> None:
+        """Keep attribute charrefs; do not retokenize escaped tag delimiters."""
+        # Escaped &lt;/&gt; (and numeric equivalents) must stay escaped so they
+        # remain inert title text. Other references (e.g. &#x2e;) belong in
+        # attribute values of literal executable markup and must be preserved.
+        if decoded in "<>":
+            self._svg_title_buffer.append(escaped)
+            return
+        self._svg_title_buffer.append(decoded)
 
     def _merge_nested_document(self, nested: SiteParser) -> None:
         self.link_refs.extend(nested.link_refs)
@@ -179,14 +201,21 @@ class SiteParser(HTMLParser):
                 self._template_depth += 1
                 return
         if tag == "noscript":
-            # Noscript fallback is inert when scripting is enabled, and scripts
-            # cannot execute when scripting is disabled either. Only the HTML
-            # element participates; SVG-namespaced noscript is not inert.
+            # Noscript fallback scripts never execute. Only the HTML element
+            # participates; SVG-namespaced noscript is not a noscript context.
             if self._in_html_namespace():
                 self._noscript_depth += 1
                 return
-        if self._in_inert_content():
-            # Ignore tags inside inert containers; browsers do not fetch/execute them.
+        if self._template_depth > 0:
+            # Ignore tags inside <template>; browsers do not fetch/execute them.
+            return
+        if self._noscript_depth > 0:
+            # When scripting is disabled, noscript fallbacks still fetch non-script
+            # resources such as stylesheets. Skip executable scripts only.
+            if tag == "link" and values.get("href"):
+                href = values["href"]
+                resolved = resolve_reference(href, self._active_base())
+                self.link_refs.append((href, resolved))
             return
         entered_html_integration = False
         if tag == "svg":
@@ -202,6 +231,7 @@ class SiteParser(HTMLParser):
                 entered_html_integration = True
                 if tag == "title":
                     # html.parser keeps title contents as text; flag for re-parse.
+                    self._svg_title_buffer.clear()
                     self._svg_title_integration = True
             else:
                 self._integration_point_pushed.append(False)
@@ -229,7 +259,9 @@ class SiteParser(HTMLParser):
             href = values["href"]
             resolved = resolve_reference(href, self._active_base())
             self.link_refs.append((href, resolved))
-        if tag == "iframe":
+        if tag == "iframe" and self._in_html_namespace():
+            # SVG-namespaced <iframe> does not create a nested browsing context;
+            # its srcdoc is inert and must not be parsed as an executable document.
             srcdoc = values.get("srcdoc")
             if srcdoc and iframe_allows_scripts("sandbox" in values, values.get("sandbox")):
                 # about:srcdoc inherits the embedding document's base URL.
@@ -269,6 +301,8 @@ class SiteParser(HTMLParser):
         if tag in SVG_HTML_INTEGRATION_POINTS:
             # Pop HTML namespace only when this end tag matches a start that pushed.
             if tag == "title":
+                if self._svg_title_integration:
+                    self._flush_svg_title_buffer()
                 self._svg_title_integration = False
                 self._in_title = False
             if self._integration_point_pushed and self._integration_point_pushed.pop():
@@ -280,19 +314,17 @@ class SiteParser(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         if self._svg_title_integration:
-            # Re-parse only literal RCDATA text. Character references are handled
-            # separately and must stay inert (browsers do not retokenize them).
-            if data.strip():
-                nested = SiteParser(fallback_base=self._active_base())
-                nested.feed(data)
-                self._merge_nested_document(nested)
+            # Buffer fragments; charrefs may split RCDATA mid-attribute.
+            self._svg_title_buffer.append(data)
             return
         if self._in_title:
             self.title += data.strip()
 
     def handle_entityref(self, name: str) -> None:
-        # Escaped SVG title markup must remain text; do not re-parse entity output.
         if self._svg_title_integration:
+            char = html_entities.name2codepoint.get(name)
+            if char is not None:
+                self._append_svg_title_reference(f"&{name};", chr(char))
             return
         if self._in_title:
             char = html_entities.name2codepoint.get(name)
@@ -301,6 +333,11 @@ class SiteParser(HTMLParser):
 
     def handle_charref(self, name: str) -> None:
         if self._svg_title_integration:
+            try:
+                decoded = chr(int(name[1:], 16) if name[:1].lower() == "x" else int(name))
+            except ValueError:
+                return
+            self._append_svg_title_reference(f"&#{name};", decoded)
             return
         if self._in_title:
             try:
@@ -330,7 +367,11 @@ def is_external(reference: str) -> bool:
     # Network-path URLs (//host/...) have a nonempty authority and are fetched
     # from that host even without an explicit scheme. Treat them as external so
     # path-normalization cannot reclassify them as local repository files.
-    return bool(parsed.netloc)
+    if parsed.netloc:
+        return True
+    # Triple-slash (or more) forms keep an empty urllib netloc, but browsers
+    # still parse an authority (e.g. ///workspace/... → host "workspace").
+    return reference.startswith("///")
 
 
 def resolve_reference(reference: str, base_href: str | None) -> str:
