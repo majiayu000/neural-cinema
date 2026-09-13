@@ -46,7 +46,8 @@ class SiteParser(HTMLParser):
         self._in_title = False
         self._template_depth = 0
         self._noscript_depth = 0
-        self._svg_depth = 0
+        # Track HTML vs SVG namespace so foreignObject HTML scripts use src.
+        self._namespaces: list[str] = ["html"]
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
         # Explicit HTML <base href>; fallback_base is used for about:srcdoc inheritance.
@@ -60,6 +61,15 @@ class SiteParser(HTMLParser):
     def _active_base(self) -> str | None:
         return self.base_href if self.base_href is not None else self._fallback_base
 
+    def _current_namespace(self) -> str:
+        return self._namespaces[-1]
+
+    def _in_svg_namespace(self) -> bool:
+        return self._current_namespace() == "svg"
+
+    def _in_html_namespace(self) -> bool:
+        return self._current_namespace() == "html"
+
     def _in_inert_content(self) -> bool:
         # <template> and <noscript> contents are not executable dependencies.
         return self._template_depth > 0 or self._noscript_depth > 0
@@ -68,6 +78,13 @@ class SiteParser(HTMLParser):
         self.link_refs.extend(nested.link_refs)
         self.script_refs.extend(nested.script_refs)
         self.external_scripts.extend(nested.external_scripts)
+
+    def _enter_namespace(self, namespace: str) -> None:
+        self._namespaces.append(namespace)
+
+    def _leave_namespace(self, namespace: str) -> None:
+        if len(self._namespaces) > 1 and self._namespaces[-1] == namespace:
+            self._namespaces.pop()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
@@ -85,18 +102,23 @@ class SiteParser(HTMLParser):
             # Ignore tags inside inert containers; browsers do not fetch/execute them.
             return
         if tag == "svg":
-            self._svg_depth += 1
+            self._enter_namespace("svg")
+        elif tag == "foreignobject" and self._in_svg_namespace():
+            # foreignObject is an HTML integration point; descendants are HTML
+            # until a nested <svg> re-enters the SVG namespace.
+            self._enter_namespace("html")
         if tag == "title":
             self._in_title = True
         if (
             tag == "base"
-            and self._svg_depth == 0
+            and self._in_html_namespace()
             and self.base_href is None
             and values.get("href")
         ):
             # Only HTML-namespace <base> sets the document base; SVG <base> is ignored.
-            # Encounter-time resolution still matters for classic scripts before it.
-            self.base_href = values["href"]
+            # Resolve against the inherited fallback so relative nested bases cannot
+            # hide external scripts as local repository paths.
+            self.base_href = resolve_reference(values["href"], self._fallback_base)
         if tag == "meta" and values.get("name") == "description":
             self.meta_description = values.get("content") or ""
         if tag == "canvas" and values.get("id"):
@@ -113,7 +135,7 @@ class SiteParser(HTMLParser):
                 nested.feed(srcdoc)
                 self._merge_nested_document(nested)
         if tag == "script":
-            src = script_resource_url(values, self._svg_depth > 0)
+            src = script_resource_url(values, self._in_svg_namespace())
             if src:
                 resolved_src = resolve_reference(src, self._active_base())
                 self.script_refs.append((src, resolved_src))
@@ -142,9 +164,11 @@ class SiteParser(HTMLParser):
             return
         if self._in_inert_content():
             return
+        if tag == "foreignobject":
+            self._leave_namespace("html")
+            return
         if tag == "svg":
-            if self._svg_depth > 0:
-                self._svg_depth -= 1
+            self._leave_namespace("svg")
             return
         if tag == "title":
             self._in_title = False
@@ -184,7 +208,8 @@ def iframe_allows_scripts(has_sandbox: bool, sandbox: str | None) -> bool:
     """True when an iframe may execute scripts (no sandbox, or allow-scripts)."""
     if not has_sandbox:
         return True
-    tokens = (sandbox or "").split()
+    # HTML sandbox keywords are ASCII case-insensitive in browsers.
+    tokens = (sandbox or "").casefold().split()
     return "allow-scripts" in tokens
 
 
@@ -216,10 +241,14 @@ def normalize_local_reference(reference: str) -> Path:
 
 
 def is_anonymous_crossorigin(crossorigin: str | None) -> bool:
-    """True for the CORS anonymous state, including the empty-value shorthand."""
+    """True for the CORS anonymous state, including the empty-value shorthand.
+
+    HTML CORS settings treat a missing/empty value and any keyword other than
+    ``use-credentials`` (including invalid values) as the anonymous state.
+    """
     if crossorigin is None or crossorigin == "":
         return True
-    return crossorigin.casefold() == "anonymous"
+    return crossorigin.casefold() != "use-credentials"
 
 
 def pad_base64(digest: str) -> str:
