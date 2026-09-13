@@ -27,7 +27,7 @@ SRI_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 SRI_OPTION_EXPRESSION_RE = re.compile(r"^[\x21-\x7E]+$")
 # SRI/HTML "split on ASCII whitespace": TAB, LF, FF, CR, SPACE (not Unicode NBSP).
 SRI_ASCII_WHITESPACE_RE = re.compile(r"[ \t\n\r\f]+")
-SECURITY_SCRIPT_ATTRS = frozenset({"src", "integrity", "crossorigin"})
+SECURITY_SCRIPT_ATTRS = frozenset({"src", "href", "xlink:href", "integrity", "crossorigin"})
 # Pin CDN URL → expected SRI token so mistyped/stale digests fail without fetching.
 TRUSTED_EXTERNAL_SCRIPT_INTEGRITY = {
     "https://unpkg.com/three@0.149.0/build/three.min.js": (
@@ -45,12 +45,19 @@ class SiteParser(HTMLParser):
         self.title = ""
         self._in_title = False
         self._template_depth = 0
+        self._noscript_depth = 0
+        self._svg_depth = 0
         self.meta_description = ""
         self.canvas_ids: set[str] = set()
         self.base_href: str | None = None
-        self.link_hrefs: list[str] = []
-        self.script_srcs: list[str] = []
+        # (raw, resolved_at_encounter) so later <base> cannot rewrite earlier refs.
+        self.link_refs: list[tuple[str, str]] = []
+        self.script_refs: list[tuple[str, str]] = []
         self.external_scripts: list[dict[str, object]] = []
+
+    def _in_inert_content(self) -> bool:
+        # <template> and <noscript> contents are not executable dependencies.
+        return self._template_depth > 0 or self._noscript_depth > 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # Browsers keep the first duplicate attribute; dict(attrs) would last-win.
@@ -59,44 +66,63 @@ class SiteParser(HTMLParser):
             # Template contents are inert; nested templates still nest the depth.
             self._template_depth += 1
             return
-        if self._template_depth > 0:
-            # Ignore tags inside <template>; browsers do not fetch/execute them.
+        if tag == "noscript":
+            # Noscript fallback is inert when scripting is enabled, and scripts
+            # cannot execute when scripting is disabled either.
+            self._noscript_depth += 1
             return
+        if self._in_inert_content():
+            # Ignore tags inside inert containers; browsers do not fetch/execute them.
+            return
+        if tag == "svg":
+            self._svg_depth += 1
         if tag == "title":
             self._in_title = True
         if tag == "base" and self.base_href is None and values.get("href"):
             # HTML uses the first <base href>; later bases are ignored.
+            # Encounter-time resolution still matters for classic scripts before it.
             self.base_href = values["href"]
         if tag == "meta" and values.get("name") == "description":
             self.meta_description = values.get("content") or ""
         if tag == "canvas" and values.get("id"):
             self.canvas_ids.add(values["id"])
         if tag == "link" and values.get("href"):
-            self.link_hrefs.append(values["href"])
-        if tag == "script" and values.get("src"):
-            src = values["src"]
-            self.script_srcs.append(src)
-            resolved_src = resolve_reference(src, self.base_href)
-            if is_external(resolved_src):
-                self.external_scripts.append(
-                    {
-                        "src": resolved_src,
-                        "raw_src": src,
-                        "integrity": values.get("integrity"),
-                        "has_crossorigin": "crossorigin" in values,
-                        "crossorigin": values.get("crossorigin"),
-                        "duplicate_security_attrs": sorted(
-                            duplicates & SECURITY_SCRIPT_ATTRS
-                        ),
-                    }
-                )
+            href = values["href"]
+            resolved = resolve_reference(href, self.base_href)
+            self.link_refs.append((href, resolved))
+        if tag == "script":
+            src = script_resource_url(values, self._svg_depth > 0)
+            if src:
+                resolved_src = resolve_reference(src, self.base_href)
+                self.script_refs.append((src, resolved_src))
+                if is_external(resolved_src):
+                    self.external_scripts.append(
+                        {
+                            "src": resolved_src,
+                            "raw_src": src,
+                            "integrity": values.get("integrity"),
+                            "has_crossorigin": "crossorigin" in values,
+                            "crossorigin": values.get("crossorigin"),
+                            "duplicate_security_attrs": sorted(
+                                duplicates & SECURITY_SCRIPT_ATTRS
+                            ),
+                        }
+                    )
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "template":
             if self._template_depth > 0:
                 self._template_depth -= 1
             return
-        if self._template_depth > 0:
+        if tag == "noscript":
+            if self._noscript_depth > 0:
+                self._noscript_depth -= 1
+            return
+        if self._in_inert_content():
+            return
+        if tag == "svg":
+            if self._svg_depth > 0:
+                self._svg_depth -= 1
             return
         if tag == "title":
             self._in_title = False
@@ -126,10 +152,20 @@ def is_external(reference: str) -> bool:
 
 
 def resolve_reference(reference: str, base_href: str | None) -> str:
-    """Resolve a document-relative URL against the first <base href>, if any."""
+    """Resolve a document-relative URL against the active <base href>, if any."""
     if not base_href:
         return reference
     return urljoin(base_href, reference)
+
+
+def script_resource_url(values: dict[str, str | None], in_svg: bool) -> str | None:
+    """Return the executable script URL for HTML src or SVG href/xlink:href."""
+    src = values.get("src")
+    if src:
+        return src
+    if in_svg:
+        return values.get("href") or values.get("xlink:href")
+    return None
 
 
 def normalize_local_reference(reference: str) -> Path:
@@ -295,14 +331,14 @@ def validate_html(errors: list[str]) -> None:
     if "neural-canvas" not in parser.canvas_ids:
         errors.append("index.html must contain canvas#neural-canvas")
 
-    references = parser.link_hrefs + parser.script_srcs
-    for reference in references:
-        resolved = resolve_reference(reference, parser.base_href)
+    # Use encounter-time resolution; do not re-resolve against a later <base>.
+    references = parser.link_refs + parser.script_refs
+    for raw_reference, resolved in references:
         if is_external(resolved):
             if resolved.startswith("http://"):
                 errors.append(f"external reference must use https: {resolved}")
-            # External refs (including those made external by <base href>) are
-            # validated via external_scripts / CDN policy below when they are scripts.
+            # External refs (including those made external by an earlier <base>)
+            # are validated via external_scripts / CDN policy below for scripts.
             continue
         try:
             path = normalize_local_reference(resolved)
@@ -310,7 +346,7 @@ def validate_html(errors: list[str]) -> None:
             errors.append(str(exc))
             continue
         if not path.is_file():
-            errors.append(f"local reference does not exist: {reference}")
+            errors.append(f"local reference does not exist: {raw_reference}")
 
     for script in parser.external_scripts:
         src = str(script["src"] or "")
