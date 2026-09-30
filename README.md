@@ -7,7 +7,7 @@ An interactive browser demo that turns neural-network-style signal flow into a r
 
 It is a visual metaphor, not model introspection. The demo is designed for explaining and exploring how different network topologies can feel when information moves through them.
 
-Live demo: <https://majiayu000.github.io/neural-cinema/>
+Live demo: <https://majiayu000.github.io/neural-cinema/> · [Run locally](#run-locally)
 
 ## Modes
 
