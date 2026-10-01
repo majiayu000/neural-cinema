@@ -9,6 +9,8 @@ It is a visual metaphor, not model introspection. The demo is designed for expla
 
 Live demo: <https://majiayu000.github.io/neural-cinema/> · [Run locally](#run-locally)
 
+
+[Guide and FAQ](https://majiayu000.github.io/neural-cinema/guide.html)
 ## Modes
 
 - `Agent Decision MLP`: a policy bottleneck that fans out into tool, risk, and action gates.
